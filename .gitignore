@@ -1,10 +1,35 @@
+# --- environment / secrets ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- python / backend ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
-.env
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 dist/
 build/
+
+# --- node / frontend ---
+node_modules/
+.next/
+out/
+.turbo/
+next-env.d.ts
+npm-debug.log*
+
+# --- docker / data ---
+*.log
 .DS_Store
+
+# --- editors ---
+.vscode/
+.idea/
+*.swp

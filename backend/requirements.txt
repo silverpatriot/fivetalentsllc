@@ -1,0 +1,37 @@
+# Pinned for Python 3.12. Bump deliberately, not via `pip install -U`.
+
+# --- web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# --- validation / settings ---
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# --- database ---
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+alembic==1.14.0
+pgvector==0.3.6
+
+# --- background jobs ---
+celery==5.4.0
+redis==5.2.1
+
+# --- auth (Clerk JWT verification) ---
+pyjwt[crypto]==2.10.1
+
+# --- billing ---
+stripe==11.4.1
+
+# --- http client ---
+httpx==0.28.1
+
+# --- resilience ---
+tenacity==9.0.0
+
+# --- testing ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
