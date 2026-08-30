@@ -14,4 +14,3 @@ pip install -e .
 sermon_engine/   # library source
 tests/           # test suite
 ```
-2026-08-30T22:59:58Z auth test
