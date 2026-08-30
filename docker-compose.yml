@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    # Not exposed to the host — only other services on the internal network
+    # reach Postgres. Cloudflare Tunnel has no reason to see this port.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    # Reached only over the internal network — by `frontend` (server-side
+    # calls to http://backend:8000) and, later, `celery-worker`. Cloudflare
+    # Tunnel routes to `frontend`, not here. If a future phase needs
+    # something public to hit this directly (e.g. a Stripe webhook), route
+    # it through a Next.js route handler that proxies internally, or add a
+    # dedicated tunnel hostname for it then — don't expose this port as a
+    # default.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  celery-worker:
+    build:
+      context: ./backend
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - backend
+    ports:
+      # The only host-exposed port — this is what Cloudflare Tunnel forwards
+      # to.
+      - "3000:3000"
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
