@@ -20,7 +20,19 @@ celery_app.conf.update(
     # queue for everyone else's tasks.
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    # String references, not direct imports — a task module importing
+    # celery_app (to get the @celery_app.task decorator) while celery_app
+    # imports it back would be circular. `imports` tells the worker
+    # process to import these at startup instead.
+    imports=["app.tasks.usage_reporting"],
+    beat_schedule={
+        "sweep-unreported-usage": {
+            "task": "app.tasks.usage_reporting.sweep_unreported_usage",
+            # Safety-net sweep — record_usage_event() already queues each
+            # event's report immediately on write. This just catches
+            # anything that path missed. 5 minutes is arbitrary and cheap
+            # to tighten once there's real usage volume to tune against.
+            "schedule": 300.0,
+        },
+    },
 )
-
-# Task modules register themselves here as they're added, e.g.:
-# celery_app.autodiscover_tasks(["app.tasks.transcription", "app.tasks.generation"])

@@ -61,12 +61,13 @@ services:
     networks:
       - internal
     # Reached only over the internal network — by `frontend` (server-side
-    # calls to http://backend:8000) and, later, `celery-worker`. Cloudflare
-    # Tunnel routes to `frontend`, not here. If a future phase needs
-    # something public to hit this directly (e.g. a Stripe webhook), route
-    # it through a Next.js route handler that proxies internally, or add a
-    # dedicated tunnel hostname for it then — don't expose this port as a
-    # default.
+    # calls to http://backend:8000, including the Stripe/Clerk webhook
+    # proxy routes — see frontend/app/api/webhooks/*/route.ts for why
+    # webhooks go through Next.js rather than exposing this port
+    # directly) and by celery-worker/celery-beat. Cloudflare Tunnel
+    # routes to `frontend`, not here — its config is out of scope to
+    # change, which is exactly why webhooks are proxied instead of this
+    # port being opened.
     deploy:
       resources:
         limits:
@@ -90,6 +91,27 @@ services:
       resources:
         limits:
           memory: 2g
+
+  celery-beat:
+    build:
+      context: ./backend
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          # beat only schedules tasks (celery-worker does the actual
+          # work) — it's genuinely lightweight.
+          memory: 512m
 
   frontend:
     build:
