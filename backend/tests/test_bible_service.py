@@ -1,0 +1,130 @@
+"""app.services.bible against the real bible-api.com — no API key, no
+mocking: this is exactly the "call a free public API" case the Phase 3
+spec asked to verify live rather than assume. Needs outbound internet;
+skips itself if bible-api.com is unreachable rather than failing the
+whole suite over a network blip.
+"""
+import httpx
+import pytest
+
+from app.services import bible
+
+try:
+    _REACHABLE = httpx.get("https://bible-api.com/john+3:16", timeout=5).status_code == 200
+except httpx.HTTPError:
+    _REACHABLE = False
+
+pytestmark = pytest.mark.skipif(not _REACHABLE, reason="bible-api.com not reachable from this environment")
+
+
+async def test_fetch_passage_returns_real_kjv_text():
+    passage = await bible.fetch_passage("John 3:16", "kjv")
+    assert passage is not None
+    assert "only begotten Son" in passage.text  # KJV wording specifically, not WEB's "one and only Son"
+    assert passage.translation == "kjv"
+
+
+async def test_fetch_passage_range():
+    passage = await bible.fetch_passage("Romans 8:28-30", "kjv")
+    assert passage is not None
+    assert "work together for good" in passage.text
+    assert "predestinate" in passage.text
+
+
+async def test_fetch_passage_invalid_reference_returns_none():
+    passage = await bible.fetch_passage("Frobnitz 99:99", "kjv")
+    assert passage is None
+
+
+def test_extract_citations_finds_references_in_free_text():
+    text = (
+        'As Paul writes in Romans 8:28, "all things work together for good." '
+        "This is also true in 1 Peter 5:7 and John 3:16-18."
+    )
+    refs = bible.extract_citations(text)
+    assert "Romans 8:28" in refs
+    assert "1 Peter 5:7" in refs
+    assert "John 3:16-18" in refs
+
+
+def test_extract_citations_does_not_swallow_a_preceding_word():
+    """Regression: found live in the Phase 3 smoke test — a sentence-
+    initial capitalized word right before a real reference ("And
+    Philippians 4:19") was being absorbed into the book name, turning a
+    real, resolvable verse into a mangled one that looks hallucinated."""
+    text = "And Philippians 4:19 promises that God shall supply all your need."
+    refs = bible.extract_citations(text)
+    assert "Philippians 4:19" in refs
+    assert "And Philippians 4:19" not in refs
+
+
+def test_extract_citations_keeps_ordinal_prefixes_for_numbered_books():
+    """Regression: the opposite direction of the bug above — confirmed
+    live that "I Corinthians 13:4" was extracted as "Corinthians 13:4"
+    (ordinal dropped), which then genuinely fails to resolve against
+    either Bible source and reports a real, accurately-quoted verse as a
+    hallucinated citation. Digit, Roman-numeral, and spelled-out ordinal
+    forms must all be kept attached to the book name."""
+    text = (
+        "As I Corinthians 13:4 says, love is patient. First Corinthians 13:13 speaks of faith, "
+        "hope, and love. See also 2 Timothy 3:16 and II Timothy 2:15."
+    )
+    refs = bible.extract_citations(text)
+    assert "I Corinthians 13:4" in refs
+    assert "First Corinthians 13:13" in refs
+    assert "2 Timothy 3:16" in refs
+    assert "II Timothy 2:15" in refs
+    # None of these should have lost their ordinal prefix.
+    assert "Corinthians 13:4" not in refs
+    assert "Timothy 2:15" not in refs
+
+
+async def test_verify_citation_resolves_ordinal_forms_of_numbered_books():
+    """End-to-end: not just extraction — the ordinal forms must actually
+    resolve through fetch_passage's api.bible/bible-api.com chain too.
+    No quote attached — this is testing reference RESOLUTION, not the
+    separate quote-similarity check (a truncated quote would legitimately
+    score as a mismatch against the full multi-clause verse, which isn't
+    what this test is about)."""
+    draft = "As I Corinthians 13:4 reminds us, love is patient and kind."
+    result = await bible.verify_citation("I Corinthians 13:4", draft)
+    assert result["status"] == "verified"
+    assert result["source_text"] is not None
+    assert "suffereth long" in result["source_text"]
+
+
+async def test_verify_citation_flags_hallucinated_reference():
+    """The required test case: a deliberately wrong/hallucinated reference
+    must be flagged, not silently passed through."""
+    draft = 'The prophet declares in Habakkuk 12:5, "the fake shall live by faith."'
+    result = await bible.verify_citation("Habakkuk 12:5", draft)
+    assert result["status"] == "invalid_reference"
+    assert result["source_text"] is None
+
+
+async def test_verify_citation_flags_misquoted_real_reference():
+    """A real, resolvable reference, but the draft quotes something that
+    isn't what that verse actually says."""
+    draft = 'Jesus himself said in John 3:16, "whoever knocks shall find the door open to riches."'
+    result = await bible.verify_citation("John 3:16", draft)
+    assert result["status"] == "quote_mismatch"
+    assert result["source_text"] is not None
+    assert "everlasting life" in result["source_text"]
+
+
+async def test_verify_citation_passes_accurate_quote():
+    draft = (
+        'As John 3:16 says, "For God so loved the world, that he gave his only begotten Son, '
+        'that whosoever believeth in him should not perish, but have everlasting life."'
+    )
+    result = await bible.verify_citation("John 3:16", draft)
+    assert result["status"] == "verified"
+
+
+async def test_verify_citation_passes_reference_with_no_attached_quote():
+    """A bare parenthetical reference with nothing quoted next to it isn't
+    itself suspicious — nothing to check the wording of."""
+    draft = "God's love for the world is the whole point of the gospel (John 3:16)."
+    result = await bible.verify_citation("John 3:16", draft)
+    assert result["status"] == "verified"
+    assert result["quoted_text"] is None

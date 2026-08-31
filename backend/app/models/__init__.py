@@ -2,6 +2,7 @@
 general) sees the full schema from a single import of app.models."""
 from app.models.base import Base
 from app.models.clip import Clip
+from app.models.generation_log import GenerationLog, GenerationStage
 from app.models.media_file import MediaFile
 from app.models.sermon import Sermon, SermonFormat
 from app.models.sermon_embedding import SermonEmbedding
@@ -22,5 +23,7 @@ __all__ = [
     "Clip",
     "UsageEvent",
     "UsageEventType",
+    "GenerationLog",
+    "GenerationStage",
     "WebhookEvent",
 ]

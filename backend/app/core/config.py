@@ -108,6 +108,58 @@ class Settings(BaseSettings):
     # Stripe redirecting it) actually needs to load.
     frontend_url: str = "http://localhost:3000"
 
+    # --- OpenRouter (LLM gateway — Phase 3 Task 3) ---
+    # Blank until a real key is added to .env; every call site checks for
+    # this and raises a clear 503 rather than sending an unauthenticated
+    # request to OpenRouter.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Cheap/fast model for the outline pass, and a deliberately different,
+    # stronger/pricier model for the full draft (Task 3: "don't use the
+    # same model for both if cost matters at 250-user scale"). Both
+    # confirmed present on OpenRouter's live /models endpoint before use
+    # (not just trusted from the model slug string) — see the Phase 3
+    # completion notes for that check. Configurable so a model swap later
+    # doesn't need a code change.
+    openrouter_outline_model: str = "qwen/qwen3.8-flash"
+    openrouter_draft_model: str = "qwen/qwen3.8-27b"
+    # Attribution headers OpenRouter asks callers to send (not secrets).
+    openrouter_app_url: str = "https://kerygma.church"
+    openrouter_app_title: str = "Kerygma"
+
+    # --- Bible text source (Phase 3 Task 3) ---
+    # bible-api.com: free, no API key, and serves the public-domain KJV
+    # text via ?translation=kjv — verified live (see Phase 3 completion
+    # notes). ESV was considered and rejected for this phase: it requires
+    # API registration, a daily verse-count cap, and redistribution
+    # restrictions on quoted text, none of which fit "fetch scripture text
+    # for arbitrary sermon passages, then quote it back to the user."
+    # Revisit if a specific translation becomes a product requirement.
+    bible_api_base_url: str = "https://bible-api.com"
+    bible_translation: str = "kjv"
+
+    # api.bible (api.scripture.api.bible) — preferred source when
+    # configured, alongside bible-api.com; see app/services/bible.py's
+    # module docstring for the layering. Confirmed live before wiring in.
+    bible_api_key: str = ""
+    api_bible_base_url: str = "https://api.scripture.api.bible"
+
+    # How many of the tenant's past sermons to pull as cadence/voice
+    # examples. Deliberately a plain recency query (ORDER BY created_at
+    # DESC), NOT a pgvector similarity search over sermon_embeddings —
+    # real semantic cadence-matching is explicitly deferred alongside clip
+    # generation (see Phase 3 kickoff spec's stop line), since OpenRouter
+    # has no embeddings endpoint and populating sermon_embeddings would
+    # need a second LLM-provider key this phase doesn't have.
+    cadence_example_count: int = 3
+
+    # --- Tavily (live web search, folded into context assembly) ---
+    # Confirmed live against api.tavily.com before use. Purely additive —
+    # if blank, or if a search call fails, context assembly proceeds
+    # without a web_context section rather than blocking generation.
+    tavily_api_key: str = ""
+    web_search_max_results: int = 3
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

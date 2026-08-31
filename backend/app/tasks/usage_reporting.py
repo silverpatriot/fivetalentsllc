@@ -4,14 +4,21 @@ meter events are a downstream report of it, never the other way around.
 Two entry points:
   - record_usage_event(): call this synchronously from wherever usage
     actually happens (a transcription completing, an AI generation
-    completing — neither exists yet in this phase). It only writes to
-    Postgres and enqueues a task; it never calls Stripe itself, so it's
+    completing). It only writes to Postgres and — if the row is
+    `billable` — enqueues a task; it never calls Stripe itself, so it's
     safe to call from a request path.
   - sweep_unreported_usage(): a celery-beat periodic safety net that
     catches anything record_usage_event's queued task didn't get to
     (worker was down, task was lost, a future backfill script wrote
     usage_events directly, etc.) — belt and suspenders on top of the
     on-event path, not a replacement for it.
+
+Not every row written here is meant to be reported to Stripe — see
+`billable` on the model and record_usage_event's docstring. Phase 3
+records one row per real LLM call (outline, draft) regardless of
+success/failure, as `billable=False`, specifically so the raw ledger of
+"what actually happened" and the separate, not-yet-decided question of
+"what should a church be charged for" don't get conflated at write time.
 """
 import logging
 import uuid
@@ -22,6 +29,7 @@ from sqlalchemy import create_engine, select, text
 from app.core.config import get_settings
 from app.db.session import tenant_session_sync
 from app.models import Tenant, UsageEvent, UsageEventType
+from app.models.generation_log import GenerationStage
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -41,16 +49,41 @@ _METER_EVENT_NAMES: dict[UsageEventType, str] = {
 }
 
 
-def record_usage_event(tenant_id: uuid.UUID, event_type: UsageEventType, quantity: float) -> uuid.UUID:
-    """Write the record of what happened, then queue its Stripe report.
-    Never calls Stripe. Safe to call inline from a request/task path."""
+def record_usage_event(
+    tenant_id: uuid.UUID,
+    event_type: UsageEventType,
+    quantity: float,
+    *,
+    sermon_id: uuid.UUID | None = None,
+    generation_stage: GenerationStage | None = None,
+    outcome: str | None = None,
+    billable: bool = True,
+) -> uuid.UUID:
+    """Write the record of what happened, then — only if `billable` —
+    queue its Stripe report. Never calls Stripe directly. Safe to call
+    inline from a request/task path.
+
+    billable=False (used for Phase 3's per-LLM-call AI_GENERATION rows)
+    skips the enqueue entirely: there is deliberately no Stripe-reporting
+    path for these yet, not even a delayed one via sweep_unreported_usage
+    — see this module's docstring and app/models/usage_event.py.
+    """
     with tenant_session_sync(tenant_id) as session:
-        usage_event = UsageEvent(tenant_id=tenant_id, event_type=event_type, quantity=quantity)
+        usage_event = UsageEvent(
+            tenant_id=tenant_id,
+            event_type=event_type,
+            quantity=quantity,
+            sermon_id=sermon_id,
+            generation_stage=generation_stage,
+            outcome=outcome,
+            billable=billable,
+        )
         session.add(usage_event)
         session.flush()
         usage_event_id = usage_event.id
 
-    report_usage_event.delay(str(usage_event_id), str(tenant_id))
+    if billable:
+        report_usage_event.delay(str(usage_event_id), str(tenant_id))
     return usage_event_id
 
 
@@ -72,6 +105,15 @@ def report_usage_event(self, usage_event_id: str, tenant_id: str) -> None:
             return
         if usage_event.stripe_usage_record_id is not None:
             logger.info("usage_event %s already reported — skipping", usage_event_id)
+            return
+        if not usage_event.billable:
+            # Defense in depth — record_usage_event already skips
+            # enqueueing this task for a non-billable row, and the sweep
+            # query below excludes them too. This guard is for the case
+            # neither of those applies: something calls this task
+            # directly (a retry queued before billable existed, a manual
+            # invocation, a future call site that forgets the check).
+            logger.info("usage_event %s is not billable — skipping Stripe report", usage_event_id)
             return
 
         tenant = session.execute(select(Tenant).where(Tenant.id == tid)).scalar_one_or_none()
@@ -116,12 +158,16 @@ def report_usage_event(self, usage_event_id: str, tenant_id: str) -> None:
 
 @celery_app.task
 def sweep_unreported_usage(limit: int = 500) -> dict[str, int]:
-    """celery-beat periodic task — see module docstring."""
+    """celery-beat periodic task — see module docstring. Excludes
+    billable=false rows on purpose — those are Phase 3's per-LLM-call
+    ledger entries with no Stripe-reporting path yet; this sweep existing
+    to catch anything record_usage_event's own enqueue missed must not
+    become a second way for them to get reported anyway."""
     with _sweep_engine.begin() as conn:
         rows = conn.execute(
             text(
                 "SELECT id, tenant_id FROM usage_events "
-                "WHERE stripe_usage_record_id IS NULL ORDER BY created_at LIMIT :limit"
+                "WHERE stripe_usage_record_id IS NULL AND billable = true ORDER BY created_at LIMIT :limit"
             ),
             {"limit": limit},
         ).fetchall()
