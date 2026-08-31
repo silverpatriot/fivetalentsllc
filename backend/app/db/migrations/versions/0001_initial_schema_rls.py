@@ -10,14 +10,35 @@ Every tenant-scoped table (everything except `tenants` itself) gets:
     this, if the app connects as the same role that owns the tables (true
     here — one POSTGRES_USER), RLS is silently bypassed for that role. This
     is the single most common way to think RLS is enforced when it isn't.
-  - a policy scoped to current_setting('app.current_tenant_id', true)::uuid.
-    The `true` (missing_ok) argument makes an *unset* tenant context return
-    NULL rather than raise — and tenant_id = NULL is never true, so a
-    request that forgot to set tenant context sees zero rows, not all
-    rows. Fails closed.
+  - a policy scoped to current_setting('app.current_tenant_id')::uuid — no
+    missing_ok argument. A request with no tenant context set raises a
+    database error (unrecognized configuration parameter, or an invalid
+    ::uuid cast on '' — see below) rather than quietly returning zero
+    rows. Deliberate: on every code path in this app, "no context set" is
+    an application bug (the one legitimate no-context case — app/core/deps.
+    get_raw_db — never touches a tenant-scoped table). A bug like that
+    should be a loud 500 that gets noticed and fixed, not a silent empty
+    result set that looks like normal "no data yet" and can go unnoticed
+    for a long time. Both fail closed on the security question (never
+    leaks another tenant's rows) — this is only about which failure is
+    more operable.
+  - relatedly: current_setting(...) without missing_ok raises outright if
+    the GUC was never touched on this connection at all, but a *pooled*
+    connection that previously served a scoped request and had its LOCAL
+    setting reset at commit doesn't go back to fully unset — Postgres
+    reverts a touched custom GUC to '' (empty string), not NULL. Both
+    paths still fail closed here: NULL::uuid is fine (would've matched
+    zero rows if missing_ok were used), but ''::uuid raises an "invalid
+    input syntax" error — so dropping missing_ok makes the *first* path
+    (truly untouched connection) raise too, and the app now hard-errors
+    consistently regardless of which state a given pooled connection is
+    in, rather than behaving differently for a fresh vs. reused one.
   - the policy is USING + WITH CHECK, so it blocks both reads and writes
     (an INSERT/UPDATE trying to set a different tenant_id is rejected, not
-    silently reassigned).
+    silently reassigned) — WITH CHECK already hard-errored on missing
+    context even before this: tenant_id = NULL is always false, so
+    Postgres already rejected such an insert as a policy violation. This
+    just makes reads behave the same way writes already did.
 """
 from typing import Sequence, Union
 
@@ -182,8 +203,8 @@ def upgrade() -> None:
         op.execute(
             f"""
             CREATE POLICY tenant_isolation ON {table}
-            USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
-            WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+            USING (tenant_id = current_setting('app.current_tenant_id')::uuid)
+            WITH CHECK (tenant_id = current_setting('app.current_tenant_id')::uuid)
             """
         )
 

@@ -88,16 +88,20 @@ def test_cross_tenant_insert_is_rejected(
             )
 
 
-def test_missing_tenant_context_sees_nothing(
+def test_missing_tenant_context_raises_instead_of_leaking(
     pg_engine: Engine, two_tenants: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
     """A transaction that never calls set_tenant_context at all — the
-    'someone forgot to wire it up' bug — must fail closed (zero rows),
-    never open (all tenants' rows)."""
-    with pg_engine.begin() as conn:
-        rows = conn.execute(sa.text("SELECT * FROM sermons")).fetchall()
+    'someone forgot to wire it up' bug — must never see all tenants' rows.
 
-    assert rows == []
+    It raises rather than silently returning zero rows: deliberate, see
+    migration 0001's docstring. Both are safe (neither ever leaks another
+    tenant's data); a loud failure is more operable than one that looks
+    like ordinary empty state.
+    """
+    with pytest.raises(sa.exc.DBAPIError):
+        with pg_engine.begin() as conn:
+            conn.execute(sa.text("SELECT * FROM sermons")).fetchall()
 
 
 def test_isolation_holds_on_a_second_table(

@@ -4,9 +4,11 @@
 Every request-scoped session MUST call set_tenant_context (directly, or via
 the app.core.deps.get_db dependency) before touching any tenant-scoped
 table. Skipping it doesn't open the tenant up — with `FORCE ROW LEVEL
-SECURITY` and a fail-closed policy (see the migration), an unset
-app.current_tenant_id means every tenant-scoped query returns zero rows,
-not "all rows". It's a broken query, not a leak.
+SECURITY` and no missing_ok on the policy's current_setting() call (see
+the migration), an unset app.current_tenant_id raises a database error
+rather than returning "all rows" — or "zero rows" either, deliberately:
+silently-empty is a worse failure mode for a bug like this than a loud
+one. Either way, it's a broken query, not a leak.
 """
 import uuid
 from collections.abc import AsyncGenerator
