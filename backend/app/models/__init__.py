@@ -5,6 +5,7 @@ from app.models.clip import Clip
 from app.models.document import CorpusType, Document, DocumentChunk, DocumentSource, DocumentStatus
 from app.models.generation_log import GenerationLog, GenerationStage
 from app.models.media_file import MediaFile
+from app.models.reference import ReferenceChunk, ReferenceDocument, ReferenceType
 from app.models.sermon import Sermon, SermonFormat
 from app.models.tenant import Tenant
 from app.models.usage_event import UsageEvent, UsageEventType
@@ -24,6 +25,9 @@ __all__ = [
     "DocumentSource",
     "DocumentStatus",
     "MediaFile",
+    "ReferenceDocument",
+    "ReferenceChunk",
+    "ReferenceType",
     "Clip",
     "UsageEvent",
     "UsageEventType",

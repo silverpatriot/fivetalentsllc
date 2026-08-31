@@ -73,12 +73,28 @@ async def _fake_chat_completion(model: str, messages: list[dict]) -> tuple[str, 
     return messages[1]["content"], '{"fake":"study-response"}'
 
 
+async def _no_reference_results(*a, **k):
+    return []
+
+
+def _isolate_from_reference_corpus(monkeypatch):
+    """Every test below except test_query_includes_reference_corpus_results
+    is about the own-documents/web-search distinction specifically, not
+    the baseline reference corpus (which has its own dedicated tests in
+    test_reference_corpus.py, and — being real, live, growing data any
+    query might incidentally match — would otherwise make these tests'
+    exact citation counts and used_* flags depend on whatever happens to
+    be ingested in this environment at the time."""
+    monkeypatch.setattr("app.services.study.search_reference_corpus", _no_reference_results)
+
+
 def test_query_with_own_documents_only_when_corpus_covers_it(
     pg_engine: Engine, active_tenant: dict, auth_headers: dict, synchronous_embedding, monkeypatch
 ):
     async def _web_boom(*a, **k):
         raise AssertionError("Tavily should not have been called")
 
+    _isolate_from_reference_corpus(monkeypatch)
     monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
     # 4 documents >= MIN_OWN_RESULTS_BEFORE_WEB_SUPPLEMENT(3) — must NOT trigger Tavily.
     monkeypatch.setattr("app.services.study.search_context", _web_boom)
@@ -107,6 +123,7 @@ def test_query_with_own_documents_only_when_corpus_covers_it(
 def test_query_supplements_with_web_search_when_own_corpus_is_thin(
     pg_engine: Engine, active_tenant: dict, auth_headers: dict, synchronous_embedding, monkeypatch
 ):
+    _isolate_from_reference_corpus(monkeypatch)
     monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
 
     resp = client.post("/study/query", json={"question": "What did Calvin teach about predestination?"}, headers=auth_headers)
@@ -130,6 +147,7 @@ def test_query_with_neither_source_available_does_not_call_the_llm_or_fabricate(
     async def _no_web_results(*a, **k):
         return []
 
+    _isolate_from_reference_corpus(monkeypatch)
     monkeypatch.setattr("app.services.study.chat_completion", _chat_boom)
     monkeypatch.setattr("app.services.study.search_context", _no_web_results)
 
@@ -154,6 +172,7 @@ def test_study_corpus_query_never_returns_another_tenants_document(
 ):
     """Tenant isolation specifically through the /study/query endpoint,
     not just the underlying similarity_search function directly."""
+    _isolate_from_reference_corpus(monkeypatch)
     monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
 
     other_tenant_id = uuid.uuid4()
@@ -188,3 +207,32 @@ def test_study_corpus_query_never_returns_another_tenants_document(
     finally:
         with pg_engine.begin() as conn:
             conn.execute(sa.text("DELETE FROM tenants WHERE id = :id"), {"id": str(other_tenant_id)})
+
+
+def test_query_includes_reference_corpus_results(active_tenant: dict, auth_headers: dict, monkeypatch):
+    """The one test in this file that deliberately does NOT isolate from
+    the reference corpus — proves it's a real, live third source, using
+    whatever's actually been ingested (see scripts/ingest_baseline_corpus.py;
+    this environment has at least Matthew Henry's commentary on John 1-3
+    and cross-references for John 3:1-13 from live verification earlier
+    this phase). A tenant with zero own documents asking a question
+    those chapters actually cover should still get a real, grounded
+    answer — from the baseline corpus alone, with no own-document or web
+    citations at all."""
+
+    async def _no_web_results(*a, **k):
+        return []
+
+    monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
+    monkeypatch.setattr("app.services.study.search_context", _no_web_results)
+
+    resp = client.post(
+        "/study/query",
+        json={"question": "Who was Nicodemus and why did he come to Jesus at night?"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["used_own_documents"] is False
+    assert any(c["source_type"] == "commentary" for c in body["citations"])
+    assert "MATTHEW HENRY" in body["answer"]  # the echoed prompt — proves the section was actually populated

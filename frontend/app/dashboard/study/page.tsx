@@ -21,7 +21,7 @@ type StudyDocument = {
 };
 
 type StudyCitation = {
-  source_type: "document" | "web";
+  source_type: "document" | "commentary" | "cross_reference" | "web";
   label: string;
   title: string;
   excerpt: string;
@@ -123,8 +123,14 @@ export default function StudyPage() {
     }
   }
 
-  const documentCitations = result?.citations.filter((c) => c.source_type === "document") ?? [];
-  const webCitations = result?.citations.filter((c) => c.source_type === "web") ?? [];
+  // Four distinct provenance groups, each rendered separately — never
+  // blended — matching study.py's own grounding-source labeling.
+  const CITATION_GROUPS: { sourceType: StudyCitation["source_type"]; heading: string }[] = [
+    { sourceType: "document", heading: "From your documents" },
+    { sourceType: "commentary", heading: "From Matthew Henry's Commentary (public domain, shared reference library)" },
+    { sourceType: "cross_reference", heading: "Cross-references (public domain, shared reference library)" },
+    { sourceType: "web", heading: "From live web search — not your own documents, unverified" },
+  ];
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-8">
@@ -203,41 +209,30 @@ export default function StudyPage() {
           <div className="flex flex-col gap-4 rounded-lg border p-4">
             <p className="text-sm whitespace-pre-wrap">{result.answer}</p>
 
-            {documentCitations.length > 0 && (
-              <div className="flex flex-col gap-1.5">
-                <h3 className="text-muted-foreground text-xs font-semibold tracking-wide uppercase">
-                  From your documents
-                </h3>
-                <ul className="flex flex-col gap-1.5">
-                  {documentCitations.map((c) => (
-                    <li key={c.label} className="text-xs">
-                      <span className="text-muted-foreground">{c.label}</span>{" "}
-                      <span className="font-medium">{c.title}</span>
-                      <p className="text-muted-foreground mt-0.5 line-clamp-2">{c.excerpt}</p>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {webCitations.length > 0 && (
-              <div className="flex flex-col gap-1.5">
-                <h3 className="text-muted-foreground text-xs font-semibold tracking-wide uppercase">
-                  From live web search — not your own documents, unverified
-                </h3>
-                <ul className="flex flex-col gap-1.5">
-                  {webCitations.map((c) => (
-                    <li key={c.label} className="text-xs">
-                      <span className="text-muted-foreground">{c.label}</span>{" "}
-                      <a href={c.url ?? "#"} target="_blank" rel="noreferrer" className="font-medium hover:underline">
-                        {c.title}
-                      </a>
-                      <p className="text-muted-foreground mt-0.5 line-clamp-2">{c.excerpt}</p>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            {CITATION_GROUPS.map(({ sourceType, heading }) => {
+              const items = result.citations.filter((c) => c.source_type === sourceType);
+              if (items.length === 0) return null;
+              return (
+                <div key={sourceType} className="flex flex-col gap-1.5">
+                  <h3 className="text-muted-foreground text-xs font-semibold tracking-wide uppercase">{heading}</h3>
+                  <ul className="flex flex-col gap-1.5">
+                    {items.map((c) => (
+                      <li key={c.label} className="text-xs">
+                        <span className="text-muted-foreground">{c.label}</span>{" "}
+                        {c.url ? (
+                          <a href={c.url} target="_blank" rel="noreferrer" className="font-medium hover:underline">
+                            {c.title}
+                          </a>
+                        ) : (
+                          <span className="font-medium">{c.title}</span>
+                        )}
+                        <p className="text-muted-foreground mt-0.5 line-clamp-2">{c.excerpt}</p>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
           </div>
         )}
       </section>
