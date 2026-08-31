@@ -75,8 +75,14 @@ export default function StudyPage() {
       formData.append("file", file);
       formData.append("corpus_type", "theology");
       const resp = await fetch("/api/documents", { method: "POST", body: formData });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail ? String(data.detail) : "Upload failed");
+      if (!resp.ok) {
+        // Don't assume the error body is JSON — an expired/missing Clerk
+        // session makes middleware.ts's auth.protect() 404 with an HTML
+        // page here, and resp.json() would throw its own opaque parse
+        // error instead of surfacing anything useful.
+        const data = await resp.json().catch(() => null);
+        throw new Error(data?.detail ? String(data.detail) : `Upload failed (${resp.status})`);
+      }
       form.reset();
       await loadDocuments();
     } catch (err) {
@@ -102,8 +108,13 @@ export default function StudyPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
       });
+      if (!resp.ok) {
+        // Same reasoning as handleUpload above — the error body isn't
+        // guaranteed to be JSON, so check status before parsing.
+        const data = await resp.json().catch(() => null);
+        throw new Error(data?.detail ? String(data.detail) : `Could not answer this question (${resp.status})`);
+      }
       const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail ? String(data.detail) : "Could not answer this question");
       setResult(data);
     } catch (err) {
       setQueryError(err instanceof Error ? err.message : "Could not answer this question");
