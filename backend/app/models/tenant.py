@@ -16,4 +16,8 @@ class Tenant(Base, UUIDPkMixin, CreatedAtMixin):
     plan_tier: Mapped[str] = mapped_column(String(50), nullable=False, server_default="free")
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
-    subscription_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # pending -> active (checkout.session.completed) -> canceled
+    # (customer.subscription.deleted). Set by migration 0003; a tenant row
+    # created by the Clerk org-provisioning webhook exists in 'pending'
+    # from the moment it's created, before Stripe Checkout ever happens.
+    subscription_status: Mapped[str] = mapped_column(String(50), nullable=False, server_default="pending")

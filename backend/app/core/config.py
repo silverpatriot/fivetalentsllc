@@ -75,14 +75,38 @@ class Settings(BaseSettings):
     clerk_secret_key: str = ""
     clerk_publishable_key: str = ""
     clerk_jwks_url: str = ""
+    # Separate from clerk_secret_key — this signs webhook deliveries
+    # (Svix), not API requests. Get it from the Clerk Dashboard's webhook
+    # endpoint config, not the API keys page.
+    clerk_webhook_secret: str = ""
 
     # --- stripe ---
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
     stripe_publishable_key: str = ""
 
+    # Price/meter identifiers from Stripe — populated by running
+    # scripts/stripe_setup.py against a real (test-mode) Stripe account.
+    # Placeholders/blank until that's run; see that script and Task 2 in
+    # the Phase 2 spec for why these can't be created by this codebase on
+    # its own.
+    stripe_price_starter: str = ""
+    stripe_price_growth: str = ""
+    stripe_price_enterprise: str = ""
+    stripe_meter_transcription_minutes: str = ""
+    stripe_meter_ai_generations: str = ""
+    stripe_price_transcription_minutes: str = ""
+    stripe_price_ai_generations: str = ""
+
     # --- cors ---
     backend_cors_origins: list[str] = ["http://localhost:3000"]
+
+    # Publicly reachable frontend URL — used to build Stripe Checkout/
+    # Portal success/cancel/return URLs. NOT the internal Docker-network
+    # BACKEND_INTERNAL_URL frontend uses to reach the backend; this is the
+    # other direction, the browser-facing address a user's browser (and
+    # Stripe redirecting it) actually needs to load.
+    frontend_url: str = "http://localhost:3000"
 
     @property
     def is_production(self) -> bool:

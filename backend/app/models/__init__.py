@@ -8,6 +8,7 @@ from app.models.sermon_embedding import SermonEmbedding
 from app.models.tenant import Tenant
 from app.models.usage_event import UsageEvent, UsageEventType
 from app.models.user import User, UserRole
+from app.models.webhook_event import WebhookEvent
 
 __all__ = [
     "Base",
@@ -21,4 +22,5 @@ __all__ = [
     "Clip",
     "UsageEvent",
     "UsageEventType",
+    "WebhookEvent",
 ]

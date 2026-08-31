@@ -19,5 +19,7 @@ class TenantRead(TenantBase):
     id: uuid.UUID
     clerk_org_id: str
     plan_tier: str
-    subscription_status: str | None
+    subscription_status: str
+    stripe_customer_id: str | None
+    stripe_subscription_id: str | None
     created_at: datetime

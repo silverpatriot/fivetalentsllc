@@ -1,22 +1,28 @@
-"""Fixtures for the RLS proof tests.
-
-Requires a real Postgres with migration 0001 already applied — this is
-deliberately not mocked. RLS is a database feature; a test that doesn't
-touch a real database with the real policies in place proves nothing.
+"""Shared fixtures: the Phase 1 RLS fixtures below, plus Phase 2 additions
+— signed test payloads for Stripe/Clerk webhooks and a self-signed JWT for
+Clerk session token verification. All require a real Postgres with
+migrations applied — see the Phase 1 docstring below, still accurate.
 
     alembic upgrade head
-    pytest tests/test_rls.py
+    pytest tests/
 
 Set TEST_DATABASE_URL to point at a disposable database if you don't want
 this touching whatever DATABASE_URL_SYNC in .env points at. Falls back to
 DATABASE_URL_SYNC otherwise.
 """
+import base64
+import hashlib
+import hmac
+import json
 import os
+import time
 import uuid
 from collections.abc import Iterator
 
+import jwt
 import pytest
 import sqlalchemy as sa
+from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import Connection, Engine
 
 from app.core.config import get_settings
@@ -103,3 +109,103 @@ def two_tenants(pg_engine: Engine) -> Iterator[tuple[uuid.UUID, uuid.UUID]]:
             sa.text("DELETE FROM tenants WHERE id = :id_a OR id = :id_b"),
             {"id_a": str(tenant_a_id), "id_b": str(tenant_b_id)},
         )
+
+
+# ============================================================================
+# Phase 2: signed test payloads. These implement the SAME signing schemes
+# Stripe/Svix use client-side, so that verify_stripe_webhook /
+# verify_clerk_webhook — the actual production verification code — can be
+# exercised for real, both accepting a validly-signed payload and
+# rejecting a tampered one, without needing a live Stripe/Clerk account.
+# The signing math itself is a secondary source (not what's under test);
+# what's under test is our verification code accepting/rejecting correctly.
+# ============================================================================
+
+
+def sign_stripe_payload(payload: bytes, secret: str, *, timestamp: int | None = None) -> str:
+    """Build a Stripe-Signature header value the way Stripe itself does:
+    t=<unix ts>,v1=<hex hmac-sha256 of "{ts}.{payload}">."""
+    ts = timestamp if timestamp is not None else int(time.time())
+    signed_payload = f"{ts}.".encode() + payload
+    sig = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
+    return f"t={ts},v1={sig}"
+
+
+def sign_svix_payload(
+    msg_id: str, payload: bytes, secret: str, *, timestamp: int | None = None
+) -> dict[str, str]:
+    """Build the three svix-* headers the way Svix (Clerk's webhook
+    delivery provider) itself does. Secret is the whsec_... value as
+    given by Clerk; decode past the prefix, base64-decode the rest."""
+    ts = timestamp if timestamp is not None else int(time.time())
+    secret_bytes = base64.b64decode(secret.removeprefix("whsec_"))
+    signed_content = f"{msg_id}.{ts}.".encode() + payload
+    sig = base64.b64encode(hmac.new(secret_bytes, signed_content, hashlib.sha256).digest()).decode()
+    return {
+        "svix-id": msg_id,
+        "svix-timestamp": str(ts),
+        "svix-signature": f"v1,{sig}",
+    }
+
+
+@pytest.fixture(scope="session")
+def rsa_keypair() -> tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return private_key, private_key.public_key()
+
+
+def make_clerk_jwt(
+    private_key: rsa.RSAPrivateKey, claims: dict, *, kid: str = "test-key-1"
+) -> str:
+    """Sign a JWT shaped like a Clerk session token, using our own test
+    keypair — not Clerk's real one, which we don't have. This tests
+    verify_clerk_jwt's verification logic (signature check, claim
+    extraction) genuinely; it can't test that Clerk's real JWKS endpoint
+    is reachable or serves what we expect, which is the one part of this
+    that a real Clerk test account is unavoidably needed to prove.
+    """
+    now = int(time.time())
+    payload = {"iat": now, "exp": now + 300, **claims}
+    return jwt.encode(payload, private_key, algorithm="RS256", headers={"kid": kid})
+
+
+@pytest.fixture
+def pending_tenant(pg_engine: Engine) -> Iterator[dict]:
+    """A tenant row in the state the Clerk org-provisioning webhook
+    creates one in: 'pending', no Stripe fields yet."""
+    tenant_id = uuid.uuid4()
+    clerk_org_id = f"org_{tenant_id.hex[:16]}"
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO tenants (id, slug, name, clerk_org_id) "
+                "VALUES (:id, :slug, :name, :org)"
+            ),
+            {
+                "id": str(tenant_id),
+                "slug": f"pending-{tenant_id.hex[:8]}",
+                "name": "Pending Tenant",
+                "org": clerk_org_id,
+            },
+        )
+    yield {"id": tenant_id, "clerk_org_id": clerk_org_id}
+    with pg_engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM tenants WHERE id = :id"), {"id": str(tenant_id)})
+
+
+@pytest.fixture
+def stripe_event_factory():
+    """Build a JSON payload shaped like a real stripe.Event, with a fresh
+    event id and current timestamp — signed via sign_stripe_payload for
+    the actual HTTP test."""
+
+    def _make(event_type: str, data_object: dict, event_id: str | None = None) -> bytes:
+        body = {
+            "id": event_id or f"evt_test_{uuid.uuid4().hex}",
+            "object": "event",
+            "type": event_type,
+            "data": {"object": data_object},
+        }
+        return json.dumps(body).encode()
+
+    return _make
