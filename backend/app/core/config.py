@@ -160,6 +160,12 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     web_search_max_results: int = 3
 
+    # --- Subdomain routing (Phase 3 Task 1) ---
+    # The base domain tenant subdomains hang off (gracecommunity.<this>).
+    # Used by the frontend to strip a request's Host header down to a
+    # candidate tenant slug — see frontend/lib/tenant.ts.
+    app_base_domain: str = "kerygma.church"
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
