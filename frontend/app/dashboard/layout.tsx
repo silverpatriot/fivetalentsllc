@@ -46,6 +46,11 @@ export default async function DashboardLayout({ children }: { children: React.Re
             <Link href="/dashboard/sermons" className="hover:text-foreground text-muted-foreground">
               Sermons
             </Link>
+            {/* Phase 4 Task 3: its own nav entry, sibling to Sermons —
+                not nested inside sermon generation. */}
+            <Link href="/dashboard/study" className="hover:text-foreground text-muted-foreground">
+              Study
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-3">

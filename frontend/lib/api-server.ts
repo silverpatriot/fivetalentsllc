@@ -20,7 +20,11 @@ export async function backendFetch(path: string, init: RequestInit = {}): Promis
 
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
-  if (init.body && !headers.has("Content-Type")) {
+  // NOT for a FormData body (Phase 4 Task 3's document upload proxy) —
+  // fetch computes the correct `multipart/form-data; boundary=...` value
+  // itself only when Content-Type is left unset; forcing it to
+  // application/json here would silently corrupt every file upload.
+  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   return fetch(`${BACKEND_URL}${path}`, { ...init, headers, cache: "no-store" });

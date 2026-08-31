@@ -87,6 +87,26 @@ services:
         condition: service_healthy
     networks:
       - internal
+    # Catches the specific bug found in Phase 4 Task 3's live testing:
+    # this service builds its OWN image from the same Dockerfile as
+    # `backend` — rebuilding backend's image and recreating THIS
+    # container is not enough to give it new code, and the container
+    # comes up looking healthy regardless, with the only symptom being a
+    # task silently discarded at runtime. See
+    # scripts/check_worker_registration.py for the full story.
+    # start_period is generous — mingle/boot plus this container's own
+    # first apt/pip-free startup can take a few seconds under load.
+    healthcheck:
+      # timeout is generous, not decorative — confirmed live that a cold
+      # `python3 scripts/...` invocation (fresh interpreter, celery's own
+      # imports, a real 5s-budget broker round trip) takes ~13s in this
+      # environment; 10s made every check fail on a timeout regardless of
+      # whether registration was actually fine.
+      test: ["CMD", "python3", "scripts/check_worker_registration.py"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 20s
     deploy:
       resources:
         limits:
