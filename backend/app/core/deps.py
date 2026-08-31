@@ -68,13 +68,18 @@ async def get_current_tenant_id(
     return tenant.id
 
 
-async def get_active_tenant_id(
-    tenant: Annotated[Tenant, Depends(get_current_tenant)],
-) -> uuid.UUID:
-    """Same as get_current_tenant_id, but also enforces
-    subscription_status == 'active'. This is the actual access gate —
+def require_active_subscription(tenant: Tenant) -> uuid.UUID:
+    """The actual access-gate check — pure logic, no I/O, no `await`.
+    Split out from get_active_tenant_id specifically so it's testable
+    (tests/test_stripe_webhook_flow.py) without any event-loop machinery:
+    calling it doesn't need asyncio.run() or pytest-asyncio at all, which
+    sidesteps a real cross-event-loop issue that surfaced trying to
+    exercise the async dependency function directly in a test module that
+    also drives the app through a synchronous TestClient.
+
     Task 3 in the Phase 2 spec requires that a canceled/pending
-    subscription blocks access, not just that the DB column reflects it.
+    subscription blocks access, not just that the DB column reflects it —
+    this is that gate.
     """
     if tenant.subscription_status != "active":
         raise HTTPException(
@@ -82,6 +87,14 @@ async def get_active_tenant_id(
             detail=f"Subscription is not active (status: {tenant.subscription_status!r})",
         )
     return tenant.id
+
+
+async def get_active_tenant_id(
+    tenant: Annotated[Tenant, Depends(get_current_tenant)],
+) -> uuid.UUID:
+    """Same as get_current_tenant_id, but also enforces
+    subscription_status == 'active' — see require_active_subscription."""
+    return require_active_subscription(tenant)
 
 
 async def get_db(

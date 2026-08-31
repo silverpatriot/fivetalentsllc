@@ -23,9 +23,13 @@ from tests.conftest import sign_svix_payload
 client = TestClient(app)
 settings = get_settings()
 
-pytestmark = pytest.mark.skipif(
-    not settings.clerk_webhook_secret, reason="CLERK_WEBHOOK_SECRET not configured"
-)
+pytestmark = [
+    pytest.mark.skipif(not settings.clerk_webhook_secret, reason="CLERK_WEBHOOK_SECRET not configured"),
+    # Every test in this file writes to webhook_events via the real
+    # /webhooks/clerk route — see _clean_webhook_events in conftest.py
+    # for why this can't be autouse globally.
+    pytest.mark.usefixtures("_clean_webhook_events"),
+]
 
 
 def _org_created_payload(org_id: str, slug: str, name: str) -> bytes:
@@ -46,6 +50,7 @@ def test_organization_created_creates_pending_tenant(pg_engine: Engine):
     try:
         resp = client.post("/webhooks/clerk", content=payload, headers=headers)
         assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "ok", resp.text  # not "duplicate, skipped" — see test_stripe_webhook_flow.py
 
         with pg_engine.begin() as conn:
             row = conn.execute(

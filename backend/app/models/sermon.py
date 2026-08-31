@@ -2,11 +2,11 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Enum, ForeignKey, String, Text, func
+from sqlalchemy import ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, CreatedAtMixin, UUIDPkMixin
+from app.models.base import Base, CreatedAtMixin, UUIDPkMixin, pg_enum
 
 
 class SermonFormat(str, enum.Enum):
@@ -27,9 +27,7 @@ class Sermon(Base, UUIDPkMixin, CreatedAtMixin):
         index=True,
     )
     title: Mapped[str] = mapped_column(String(500), nullable=False)
-    format: Mapped[SermonFormat] = mapped_column(
-        Enum(SermonFormat, name="sermon_format", native_enum=True), nullable=False
-    )
+    format: Mapped[SermonFormat] = mapped_column(pg_enum(SermonFormat, name="sermon_format"), nullable=False)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Free-form status (draft/generating/ready/published/...) — deliberately
     # not a native enum yet; the state machine isn't locked in this phase.

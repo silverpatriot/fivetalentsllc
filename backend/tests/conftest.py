@@ -209,3 +209,48 @@ def stripe_event_factory():
         return json.dumps(body).encode()
 
     return _make
+
+
+# NOTE: an earlier version of this file had an autouse fixture here that
+# disposed app.db.session.engine's pool after every test, to stop stale
+# asyncpg connections from a closed event loop leaking into the next
+# test. It didn't fully work — test_duplicate_checkout_event_is_not_reprocessed
+# makes two requests inside ONE test, and disposal between tests never
+# ran between those two calls, so the collision could still happen
+# within a single test. The actual fix is upstream, in
+# app/db/session.py: the engine is constructed with NullPool whenever
+# the process is pytest, so there's never a pooled connection to begin
+# with, regardless of how many requests one test makes or which HTTP
+# test client style it uses. Nothing to do here anymore — that's rather
+# the point.
+
+
+@pytest.fixture
+def _clean_webhook_events(pg_engine: Engine) -> Iterator[None]:
+    """webhook_events is the idempotency ledger (source, external_event_id)
+    — see app/core/idempotency.py. Nothing was ever cleaning it up between
+    test runs, and several tests use fixed, hardcoded event ids
+    ("evt_checkout_1", etc.) rather than fresh ones. Against a database
+    that isn't wiped between runs (true for most of this project's local
+    dev workflow), a SECOND run finds those ids already claimed from the
+    FIRST run and correctly (by design) treats them as duplicate
+    deliveries — try_claim_event returns False, the handler never runs,
+    and the webhook still returns 200. That's not a bug in the app; it's
+    stale fixture data defeating the exact mechanism the idempotency
+    tests are trying to prove.
+
+    NOT autouse=True: that applied it to every test in the suite,
+    including test_org_context.py/test_clerk_jwt.py/test_webhook_crypto.py,
+    which are deliberately runnable with zero database — pytest.py wants
+    pg_engine (a live Postgres connection) to even set up, so autouse
+    broke that property for tests that never touch webhook_events at all.
+    Instead: test_stripe_webhook_flow.py and test_clerk_webhook_flow.py —
+    the only files that write to webhook_events — pull this in via a
+    module-level `pytestmark = [..., pytest.mark.usefixtures(...)]`, which
+    applies it to every test *in those files* automatically, so a new
+    test added there still can't forget it, without forcing a DB
+    dependency onto files that were never meant to have one.
+    """
+    with pg_engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM webhook_events"))
+    yield

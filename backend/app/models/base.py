@@ -4,16 +4,40 @@ Every tenant-scoped table gets its RLS policy from the migration, not from
 these mixins — the mixin only supplies the `tenant_id` *column*. See
 app/db/migrations/versions/0001_initial_schema_rls.py for the policies.
 """
+import enum
 import uuid
 from datetime import datetime
+from typing import TypeVar
 
-from sqlalchemy import func
+from sqlalchemy import Enum, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+_E = TypeVar("_E", bound=enum.Enum)
+
+
+def pg_enum(enum_cls: type[_E], name: str) -> Enum:
+    """A Postgres native enum column bound to a Python str-enum, matching
+    the DB's actual values.
+
+    Without values_callable, SQLAlchemy's Enum type binds/reads using the
+    Python enum MEMBER NAME (e.g. "AI_GENERATION"), not its .value (e.g.
+    "ai_generation") — even when the enum also subclasses str. The
+    Postgres native enum types created in the migrations only have the
+    lowercase .value strings, so an ORM insert through a plain
+    Enum(SomeEnum, ...) column fails with "invalid input value for enum"
+    the first time anything actually inserts through it. Raw-SQL inserts
+    (as tests/test_rls.py's fixtures use) never exercise this path at
+    all, which is exactly how this sat undetected through Phase 1 — the
+    first ORM-level insert through an enum column was Phase 2's
+    record_usage_event().
+    """
+    return Enum(enum_cls, name=name, native_enum=True, values_callable=lambda cls: [e.value for e in cls])
 
 
 class UUIDPkMixin:

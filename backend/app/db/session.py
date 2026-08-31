@@ -10,6 +10,7 @@ rather than returning "all rows" — or "zero rows" either, deliberately:
 silently-empty is a worse failure mode for a bug like this than a loud
 one. Either way, it's a broken query, not a leak.
 """
+import sys
 import uuid
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
@@ -18,16 +19,35 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 
 settings = get_settings()
 
+# Pooled asyncpg connections bind to whichever asyncio event loop was
+# running when they were first opened. Under pytest, that's frequently
+# NOT a single consistent loop across requests: Starlette's TestClient
+# runs the ASGI app through AnyIO's BlockingPortal, and reusing a
+# connection checked out under one loop from a later request that's
+# running under a different one either raises ("attached to a different
+# loop") or — confirmed directly, by calling a route handler outside
+# pytest entirely and comparing — can silently produce wrong results with
+# no exception at all. NullPool means every checkout opens a fresh
+# connection and closes it right after use, so there's never a pooled
+# connection old enough to be bound to some other, possibly-dead loop.
+# Detected via sys.modules, not an env var: this can't be forgotten by a
+# future test file, or accidentally left on/off by a missing setting —
+# it's true exactly when the process is actually pytest, checked once,
+# at the only place this engine gets constructed. Production processes
+# (uvicorn, celery) never import pytest, so they get the pooled engine
+# as before; nothing about this touches production behavior.
+_TESTING = "pytest" in sys.modules
+
 engine: AsyncEngine = create_async_engine(
     settings.database_url,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=10,
+    **({"poolclass": NullPool} if _TESTING else {"pool_size": 10, "max_overflow": 10}),
 )
 
 AsyncSessionLocal = async_sessionmaker(

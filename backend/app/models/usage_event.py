@@ -1,11 +1,11 @@
 import enum
 import uuid
 
-from sqlalchemy import Enum, ForeignKey, Numeric, String
+from sqlalchemy import ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, CreatedAtMixin, UUIDPkMixin
+from app.models.base import Base, CreatedAtMixin, UUIDPkMixin, pg_enum
 
 
 class UsageEventType(str, enum.Enum):
@@ -26,7 +26,7 @@ class UsageEvent(Base, UUIDPkMixin, CreatedAtMixin):
         index=True,
     )
     event_type: Mapped[UsageEventType] = mapped_column(
-        Enum(UsageEventType, name="usage_event_type", native_enum=True), nullable=False
+        pg_enum(UsageEventType, name="usage_event_type"), nullable=False
     )
     quantity: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
     stripe_usage_record_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
