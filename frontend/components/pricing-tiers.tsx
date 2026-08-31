@@ -51,6 +51,19 @@ function CheckoutButton({ planTier, highlighted }: { planTier: string; highlight
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ plan_tier: planTier }),
       });
+      if (resp.status === 404) {
+        // The only way POST /billing/checkout 404s is get_current_tenant
+        // (app/core/deps.py) finding no tenants row for this org yet —
+        // normal right after creating an organization, before Clerk's
+        // organization.created webhook has been processed (or, if it
+        // persists, a sign that webhook delivery isn't configured/
+        // working at all). Either way, the raw backend detail ("Unknown
+        // tenant") is an implementation detail, not something to show a
+        // pastor as-is.
+        throw new Error(
+          "Your church's workspace is still being set up — this can take a few seconds after creating your organization. Try again shortly."
+        );
+      }
       const data = await resp.json();
       if (!resp.ok) {
         throw new Error(data.detail || "Could not start checkout");
@@ -80,7 +93,13 @@ function CheckoutButton({ planTier, highlighted }: { planTier: string; highlight
           </Link>
         )}
       </Show>
-      {error && <p className="text-destructive text-xs">{error}</p>}
+      {/* A visually distinct alert, not a plain <p> — the earlier version
+          rendered as an unstyled line of text that blended into the
+          feature list above it, reading like static page content
+          instead of an error tied to this button. */}
+      {error && (
+        <p className="bg-destructive/10 text-destructive rounded-md px-2 py-1.5 text-xs">{error}</p>
+      )}
     </div>
   );
 }
