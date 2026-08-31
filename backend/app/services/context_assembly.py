@@ -3,15 +3,27 @@ cadence examples, and format instructions kept as distinct, labeled
 sections rather than concatenated into one blob (Task 3: "so the model can
 weight them appropriately").
 
-Cadence matching here is a plain recency query over the tenant's own past
-sermons (ORDER BY created_at DESC LIMIT N) — NOT a pgvector similarity
-search over sermon_embeddings, even though that table exists from Phase 1.
-Real semantic cadence-matching is deferred alongside clip generation (see
-the Phase 3 kickoff spec's stop line, and the decision recorded in this
-phase's completion report): OpenRouter has no embeddings endpoint, so
-populating sermon_embeddings would need a second LLM-provider key this
-phase was never given. Recency is a reasonable stand-in for "how does this
-pastor usually sound" until that lands for real.
+Cadence matching (Phase 4) is real pgvector cosine-similarity search
+against the shared cadence corpus — see fetch_cadence_examples, and
+app/services/retrieval.py for the generic search function both this and
+the (separate, standalone) theology corpus call. The query vector is an
+embedding of this NEW sermon's own title/topic/passage (the only text
+that exists before generation runs); the past sermons whose *content*
+embeds closest to that are surfaced as voice examples. That's a proxy for
+"topically similar," not literally "same voice independent of topic" —
+but it's what the kickoff spec's "replace recency with similarity search"
+asks for, and topically-similar past sermons are a reasonable stand-in
+for how this pastor tends to sound on a given kind of subject.
+
+Ingestion into the cadence corpus (app/services/ingestion.py, queued via
+Celery — see app/tasks/embeddings.py) happens at sermon finalization,
+never inline here. A tenant with sermons that predate that trigger, that
+never finished generating, or that simply hasn't finalized any sermon
+yet, has no chunks in the cadence corpus for those sermons; the search
+below naturally returns fewer (or zero) examples rather than erroring,
+which is exactly the cold-start behavior _cadence_section already renders
+as an explicit "no examples yet" instruction to the model, not a silent
+gap.
 """
 import dataclasses
 import logging
@@ -21,8 +33,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.models.document import CorpusType, Document
 from app.models.sermon import Sermon, SermonFormat
 from app.services.bible import ScripturePassage, fetch_passage
+from app.services.embeddings import EmbeddingError, embed_text
+from app.services.retrieval import similarity_search
 from app.services.web_search import WebSearchError, search_context
 
 logger = logging.getLogger(__name__)
@@ -59,6 +74,15 @@ _FORMAT_INSTRUCTIONS: dict[SermonFormat, str] = {
 class CadenceExample:
     title: str
     excerpt: str
+    # Cosine distance to the query vector (0 = identical, larger = less
+    # similar). Not shown to the model — meaningless to an LLM as a bare
+    # number in the prompt — but kept on the object for logging and for
+    # tests/test_cadence_retrieval.py to assert against directly: the
+    # titles still end up in generation_logs.prompt in this same
+    # ascending-distance order, which is what a real generation is
+    # checked against to confirm examples are the most-similar sermons,
+    # not just the most recent.
+    distance: float
 
 
 @dataclasses.dataclass
@@ -79,24 +103,63 @@ class AssembledContext:
     web_results: list[WebResult]
 
 
+def _cadence_query_text(sermon: Sermon, passage_reference: str | None, topic: str | None) -> str:
+    """What this NEW sermon is embedded as, to search for topically/
+    voice-similar past sermons against — see this module's docstring.
+    Built from whatever's actually available before generation runs:
+    title always exists (NOT NULL on the model); passage/topic are
+    whichever the pastor gave for this request."""
+    parts = [sermon.title, topic, passage_reference]
+    return " — ".join(p for p in parts if p)
+
+
 async def fetch_cadence_examples(
-    db: AsyncSession, exclude_sermon_id: uuid.UUID, limit: int | None = None
+    db: AsyncSession,
+    sermon: Sermon,
+    passage_reference: str | None,
+    topic: str | None,
+    limit: int | None = None,
 ) -> list[CadenceExample]:
-    """Most recent other sermons for the current tenant that have content
-    to learn a voice from. `db` is already RLS-scoped to the tenant (see
-    app.core.deps.get_db) — no explicit tenant_id filter needed here, the
-    same way every other query through this session works."""
+    """The tenant's own cadence-corpus documents (past sermons — generated
+    in Kerygma or uploaded, per Task 2) whose content is most similar
+    (pgvector cosine distance) to this new sermon's title/topic/passage —
+    see this module's docstring for what "similar" means here and why.
+    `db` is already RLS-scoped to the tenant (app.core.deps.get_db /
+    app.db.session.tenant_session) — no explicit tenant_id filter needed,
+    the same way every other query through this session works, and the
+    same property tests/test_cadence_retrieval.py's isolation test relies
+    on: a query embedding chosen to rank another tenant's document highest
+    still can't see it, because RLS filters before ORDER BY ever runs.
+
+    dedupe_by_document=True: three chunks from the same one past sermon
+    isn't three voice examples, it's one sermon shown three times — see
+    app/services/retrieval.py's docstring.
+
+    Best-effort like fetch_web_context: an embeddings-API hiccup degrades
+    to "no examples this time" (logged) rather than failing the whole
+    generation over what's an enhancement, not a hard requirement.
+    """
     limit = limit or settings.cadence_example_count
-    result = await db.execute(
-        select(Sermon)
-        .where(Sermon.id != exclude_sermon_id, Sermon.content.isnot(None), Sermon.content != "")
-        .order_by(Sermon.created_at.desc())
-        .limit(limit)
+    query_text = _cadence_query_text(sermon, passage_reference, topic)
+    try:
+        query_vector = await embed_text(query_text)
+    except EmbeddingError:
+        logger.warning("Cadence-matching embedding failed for sermon %s — proceeding with no examples", sermon.id, exc_info=True)
+        return []
+
+    # A regeneration of an already-finalized sermon would otherwise be
+    # able to match itself — it's already in its own tenant's cadence
+    # corpus by the time a second /generate call runs.
+    own_document = (
+        await db.execute(select(Document.id).where(Document.sermon_id == sermon.id))
+    ).scalar_one_or_none()
+    exclude_ids = [str(own_document)] if own_document else None
+
+    results = await similarity_search(
+        db, CorpusType.CADENCE.value, query_vector, limit, dedupe_by_document=True, exclude_document_ids=exclude_ids
     )
-    sermons = result.scalars().all()
     return [
-        CadenceExample(title=s.title, excerpt=(s.content or "")[:4000])
-        for s in sermons
+        CadenceExample(title=r.document_title, excerpt=r.content[:4000], distance=r.distance) for r in results
     ]
 
 
@@ -126,7 +189,7 @@ async def assemble_context(
     translation: str | None = None,
 ) -> AssembledContext:
     scripture = await fetch_passage(passage_reference, translation) if passage_reference else None
-    cadence_examples = await fetch_cadence_examples(db, exclude_sermon_id=sermon.id)
+    cadence_examples = await fetch_cadence_examples(db, sermon, passage_reference, topic)
     web_results = await fetch_web_context(passage_reference, topic)
     return AssembledContext(
         title=sermon.title,

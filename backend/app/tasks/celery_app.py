@@ -24,7 +24,7 @@ celery_app.conf.update(
     # celery_app (to get the @celery_app.task decorator) while celery_app
     # imports it back would be circular. `imports` tells the worker
     # process to import these at startup instead.
-    imports=["app.tasks.usage_reporting"],
+    imports=["app.tasks.usage_reporting", "app.tasks.embeddings"],
     beat_schedule={
         "sweep-unreported-usage": {
             "task": "app.tasks.usage_reporting.sweep_unreported_usage",

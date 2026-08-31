@@ -53,6 +53,13 @@ async def create_sermon(
     # omitting this raised "new row violates row-level security policy"
     # rather than silently inserting under the wrong tenant, which is the
     # correct failure mode but was still a real bug to catch here.
+    # NOTE: content supplied directly here (rather than via generation or
+    # the /documents upload pipeline) does NOT get ingested into the
+    # cadence corpus — Task 2 defines exactly two ingestion paths
+    # (finalized-in-Kerygma, and Task 1's file-upload endpoint), and a
+    # bare JSON `content` field fits neither cleanly. A pastor wanting an
+    # old manuscript in their cadence corpus has a real path for that:
+    # upload it via POST /documents.
     sermon = Sermon(tenant_id=tenant_id, title=body.title, format=body.format, content=body.content)
     db.add(sermon)
     await db.flush()

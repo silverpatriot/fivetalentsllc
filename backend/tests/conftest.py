@@ -254,3 +254,41 @@ def _clean_webhook_events(pg_engine: Engine) -> Iterator[None]:
     with pg_engine.begin() as conn:
         conn.execute(sa.text("DELETE FROM webhook_events"))
     yield
+
+
+@pytest.fixture
+def synchronous_embedding(monkeypatch):
+    """Phase 4: app/services/ingestion.py enqueues chunk embedding via
+    app.tasks.embeddings.embed_document_chunks.delay(...). In production
+    that's real async-to-Celery behavior — the enqueued task is only
+    picked up by a worker later, after the request's own transaction has
+    committed, over a completely separate (sync) database connection.
+
+    A test needs that same ordering respected, not "run the task
+    immediately inline": embed_document_chunks reads the documents row
+    via tenant_session_sync (a distinct engine/connection from the async
+    session ingest_text's caller is using), so if it ran before that
+    caller's `async with tenant_session(...)` block has exited and
+    committed, it would look for a row that — from its connection's point
+    of view — doesn't exist yet. (Confirmed the hard way: an earlier
+    version of this fixture ran the task inline immediately and every
+    call logged "document ... not found ... skipping embedding".)
+
+    So `.delay` is captured, not run — call the fixture's return value
+    AFTER the surrounding `async with tenant_session(...)` block has
+    exited, once the document row is actually committed, to run every
+    captured call via `.apply(throw=True)` (same in-process-no-broker
+    pattern tests/test_usage_reporting.py uses for report_usage_event).
+    """
+    import app.services.ingestion as ingestion_module
+    from app.tasks.embeddings import embed_document_chunks
+
+    pending: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(ingestion_module.embed_document_chunks, "delay", lambda *a, **k: pending.append((a, k)))
+
+    def _run_pending() -> None:
+        while pending:
+            args, kwargs = pending.pop(0)
+            embed_document_chunks.apply(args=args, kwargs=kwargs, throw=True)
+
+    return _run_pending

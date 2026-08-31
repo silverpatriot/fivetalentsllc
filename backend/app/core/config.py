@@ -127,6 +127,25 @@ class Settings(BaseSettings):
     openrouter_app_url: str = "https://kerygma.church"
     openrouter_app_title: str = "Kerygma"
 
+    # --- Embeddings (Phase 4 Task 1: cadence matching) ---
+    # The Phase 3 kickoff spec's stop line said "OpenRouter has no
+    # embeddings endpoint" — checked again for real at the start of this
+    # phase rather than trusting that note, and it's wrong: POST
+    # {openrouter_base_url}/embeddings works live, proxying to OpenAI
+    # (provider="OpenAI", is_byok=false — OpenRouter's own arrangement,
+    # not a second key of ours) and returns exactly 1536 dims, matching
+    # EMBEDDING_DIM in app/models/sermon_embedding.py already. No second
+    # LLM-provider key needed after all.
+    embedding_model: str = "openai/text-embedding-3-small"
+    # Practical safeguard on the synchronous extract+chunk step in
+    # app/api/documents.py — no object storage exists in this stack to
+    # hand an oversized upload off to instead (see that module's
+    # docstring), so this is the backstop against an unbounded upload
+    # blocking the request indefinitely. 20MB comfortably covers a large
+    # sermon manuscript or a lengthy PDF paper; revisit if that's not
+    # true for real uploads once this ships.
+    max_upload_size_bytes: int = 20 * 1024 * 1024
+
     # --- Bible text source (Phase 3 Task 3) ---
     # bible-api.com: free, no API key, and serves the public-domain KJV
     # text via ?translation=kjv — verified live (see Phase 3 completion

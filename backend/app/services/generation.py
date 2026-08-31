@@ -31,12 +31,14 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
 from app.db.session import tenant_session
+from app.models.document import CorpusType, DocumentSource
 from app.models.generation_log import GenerationLog, GenerationStage
 from app.models.sermon import Sermon
 from app.models.usage_event import UsageEventType
 from app.schemas.generation import GenerateRequest
 from app.services import bible
 from app.services.context_assembly import assemble_context, build_draft_messages, build_outline_messages
+from app.services.ingestion import ingest_text
 from app.services.openrouter import OpenRouterError, chat_completion, stream_chat_completion
 from app.tasks.usage_reporting import record_usage_event
 
@@ -200,6 +202,23 @@ async def _run(
     sermon.content = draft_text
     sermon.status = "ready"
     await db.flush()
+
+    # Finalization is exactly the trigger point Phase 4 specifies for
+    # cadence-corpus ingestion. chunk_text is cheap/synchronous; the
+    # actual embedding call is queued inside ingest_text (via
+    # app/tasks/embeddings.py) — this response is already streaming back
+    # to the pastor, and an extra OpenRouter round trip to embed the
+    # sermon for FUTURE cadence-matching searches has no reason to hold
+    # it up.
+    await ingest_text(
+        db,
+        tenant_id,
+        corpus_type=CorpusType.CADENCE.value,
+        source=DocumentSource.GENERATED.value,
+        title=sermon.title,
+        text=draft_text,
+        sermon_id=sermon.id,
+    )
 
     yield _sse("citations", {"flags": citation_flags})
 

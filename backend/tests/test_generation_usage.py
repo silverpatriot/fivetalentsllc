@@ -93,6 +93,13 @@ def test_generate_records_usage_event_and_generation_logs(
     # to prove "a usage_events row gets written", so the enqueue is
     # stubbed rather than requiring a live worker/broker for this test.
     monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+    # Same reasoning for Phase 4's cadence-corpus ingestion, which this
+    # test's finalization step now also triggers — real chunking/
+    # embedding of every sermon this test generates isn't what's under
+    # test here (see tests/test_document_ingestion.py for that), and
+    # would otherwise race the actual live celery-worker in this
+    # environment for no reason this test cares about.
+    monkeypatch.setattr("app.services.ingestion.embed_document_chunks.delay", lambda *a, **k: None)
 
     create_resp = client.post(
         "/sermons", json={"title": "On the Creation", "format": "expository"}, headers=auth_headers

@@ -30,6 +30,14 @@ stripe==11.4.1
 # --- http client ---
 httpx==0.28.1
 
+# --- document text extraction (Phase 4 Task 1: RAG document ingestion) ---
+# pypdf, not PyMuPDF: PyMuPDF is faster/more capable but AGPL-licensed
+# unless a commercial license is purchased — a real risk for commercial
+# SaaS, not something to pull in without that being a deliberate call.
+# pypdf is pure Python, no system dependencies, BSD-licensed.
+pypdf==6.16.2
+python-docx==1.2.0
+
 # --- resilience ---
 tenacity==9.0.0
 
