@@ -43,6 +43,21 @@ from app.services.web_search import WebSearchError, search_context
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Target spoken length for every generated sermon — a fixed product
+# decision for now, not per-request configurable (no length field exists
+# on GenerateRequest; revisit if that's ever needed). 130 wpm is a
+# deliberately conservative pastoral delivery pace — general public-
+# speaking averages run 120-160 wpm, and preaching tends toward the
+# slower end of that for emphasis, pauses, and congregational response —
+# so 20-25 minutes preached works out to roughly 2,600-3,250 words of
+# actual manuscript prose. The outline (both the pre-draft pass below and
+# the separate condense-from-manuscript pass in build_condense_outline_
+# messages) is scoped by point count and elaboration room for the same
+# target, not by a literal word count on the outline text itself — a
+# preacher speaks well beyond what an outline's bullets contain.
+_TARGET_MINUTES = "20-25"
+_TARGET_WORD_RANGE = "2,600-3,250"
+
 _FORMAT_INSTRUCTIONS: dict[SermonFormat, str] = {
     SermonFormat.EXPOSITORY: (
         "Expository: work verse-by-verse through the scripture text above. "
@@ -296,8 +311,10 @@ def build_outline_messages(ctx: AssembledContext) -> list[dict[str, str]]:
         f"## CADENCE EXAMPLES\n{sections['cadence_examples']}\n\n"
         f"## FORMAT INSTRUCTIONS\n{sections['format_instructions']}\n\n"
         f"## SUPPLEMENTARY WEB CONTEXT\n{sections['web_context']}\n\n"
-        "Produce a short outline for this sermon: 3-6 main points, each with a one-sentence "
-        "summary. No full manuscript text yet — outline only."
+        f"Produce a short outline for this sermon, scoped for a {_TARGET_MINUTES} minute preached "
+        "message: typically 3-4 main points (enough to develop each one with application and "
+        "illustration in that time, not padded thinner just to hit a higher count), each with a "
+        "one-sentence summary. No full manuscript text yet — outline only."
     )
     return [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
@@ -316,7 +333,12 @@ def build_draft_messages(ctx: AssembledContext, outline_text: str) -> list[dict[
         "cite the reference exactly (e.g. \"Romans 8:28\") so it can be checked against the "
         "source text — never quote a verse from memory without also giving its reference. If "
         "you draw on the supplementary web context, attribute it by name rather than presenting "
-        "it as scripture or as your own original thought."
+        "it as scripture or as your own original thought.\n\n"
+        f"Length: this manuscript is preached aloud, not read silently — write for a "
+        f"{_TARGET_MINUTES} minute spoken message, roughly {_TARGET_WORD_RANGE} words of actual "
+        "sermon prose (title/headers don't count toward that). Use the full length to develop "
+        "each point properly — with application and, where it fits naturally, illustration — "
+        "rather than either padding with repetition to reach it or stopping short."
     )
     return [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
@@ -341,6 +363,9 @@ def build_condense_outline_messages(manuscript_text: str) -> list[dict[str, str]
     user = (
         f"## APPROVED MANUSCRIPT\n{manuscript_text}\n\n"
         "Condense this into a preachable outline: main points and sub-points, key phrases and "
-        "transitions spelled out, scripture cited by reference only (not quoted)."
+        "transitions spelled out, scripture cited by reference only (not quoted). This manuscript "
+        f"was written for a {_TARGET_MINUTES} minute spoken message — preserve that scope: keep "
+        "every point the manuscript develops (don't drop one to shorten the outline text itself), "
+        "and don't introduce new points the manuscript doesn't have just to fill space."
     )
     return [{"role": "system", "content": _CONDENSE_SYSTEM_PROMPT}, {"role": "user", "content": user}]
