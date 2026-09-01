@@ -46,6 +46,7 @@ from app.services.context_assembly import (
 )
 from app.services.ingestion import ingest_text
 from app.services.openrouter import OpenRouterError, chat_completion, stream_chat_completion
+from app.services.plan_limits import is_ai_generation_within_quota
 from app.tasks.usage_reporting import record_usage_event
 
 logger = logging.getLogger(__name__)
@@ -62,16 +63,22 @@ async def _record_llm_call(
     """One usage_events row per real LLM call — outline and draft each
     record their own, independently, regardless of success/failure. This
     is the raw ledger of what actually happened (Phase 3 completion
-    review's decision); it is NOT the billing decision — every row this
-    writes is billable=False on purpose, so nothing here changes what a
-    tenant is actually charged until that's decided separately. See
-    app/models/usage_event.py and app/tasks/usage_reporting.py.
+    review's decision), and billable is the actual billing decision
+    (Phase 5): a failed call is never billable — it produced nothing, so
+    it can't be overage — and only counts against the tenant's plan-tier
+    quota (app/services/plan_limits.py) when it succeeded. Within that
+    quota: billable=False (included in the flat monthly price). Past it:
+    billable=True, reported to Stripe's metered ai_generations price —
+    see app/tasks/usage_reporting.py.
 
     A metering hiccup must never lose a generation that otherwise
     succeeded (or its error state) — same protective try/except as the
     original single end-of-generation call this replaced.
     """
     try:
+        billable = False
+        if outcome == "succeeded":
+            billable = not await run_in_threadpool(is_ai_generation_within_quota, tenant_id)
         await run_in_threadpool(
             record_usage_event,
             tenant_id,
@@ -80,7 +87,7 @@ async def _record_llm_call(
             sermon_id=sermon_id,
             generation_stage=stage,
             outcome=outcome,
-            billable=False,
+            billable=billable,
         )
     except Exception:
         logger.exception("Failed to record usage_events row for sermon %s (%s, %s)", sermon_id, stage.value, outcome)

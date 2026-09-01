@@ -14,14 +14,27 @@ Idempotent: every object is looked up by a stable `lookup_key` (Prices) or
 `event_name` (Meters) before creating, so re-running this after a partial
 failure, or after adding a new plan later, does not create duplicates.
 
-THE THREE FLAT PRICES BELOW ARE PLACEHOLDERS.
-$49 / $149 / $399 per month, straight from the Phase 2 spec, explicitly
-flagged there as not a real business decision. Do not launch on these
-without someone actually setting real prices. The two metered per-unit
-rates ($0.10/transcription minute, $0.05/AI generation) are this script's
-own placeholders, invented only so the Meters/Prices have *some* number to
-be created with — they need the same real-pricing-decision treatment
-before launch, and nothing about them came from the spec.
+THE TWO FLAT PRICES BELOW ARE STILL A PLACEHOLDER DOLLAR AMOUNT, not a
+placeholder structure — $29 Starter / $79 Growth is an actual pricing
+decision (Phase 5), just not yet validated against real usage/margin
+data. Enterprise's $399 stays here as an internal reference point only:
+it's deliberately NOT in PLAN_TIERS' self-serve checkout set
+(app/schemas/billing.py) — that tier is contact-sales
+(frontend/components/pricing-tiers.tsx routes its button to a mailto,
+not Checkout) — a real deal gets its own custom Stripe price when it
+closes, this one is not what an Enterprise customer is actually charged.
+
+Free has NO entry in FLAT_PLANS — it needs no Stripe object at all. See
+app/api/billing.py's activate_free_tier: a tenant lands on plan_tier=
+'free' by a direct DB write, no Checkout, no card.
+
+The two metered per-unit overage rates ($0.10/transcription minute,
+$0.05/AI generation) are this script's own placeholders, invented only
+so the Meters/Prices have *some* number to be created with — they need
+the same real-pricing-decision treatment before launch, and nothing
+about them came from any spec. See app/services/plan_limits.py for what
+"AI generation overage" now actually means (past each plan tier's
+included monthly quota).
 """
 import sys
 
@@ -36,8 +49,21 @@ stripe.api_key = settings.stripe_secret_key
 
 FLAT_PLANS = [
     # (lookup_key, display name, unit_amount in cents, currency)
-    ("kerygma_starter_monthly", "Kerygma Starter", 4900, "usd"),
-    ("kerygma_growth_monthly", "Kerygma Growth", 14900, "usd"),
+    #
+    # Starter/Growth's lookup_keys changed (not just their unit_amount)
+    # from the original kerygma_starter_monthly/kerygma_growth_monthly —
+    # Stripe Prices are immutable once created, so re-running this
+    # script against an account that already has the old $49/$149
+    # objects would just find them again by their old lookup_key and
+    # report [exists], silently leaving Checkout charging the old
+    # amount. New keys force new Price objects; the old ones are simply
+    # abandoned (harmless — nothing references them once .env's
+    # STRIPE_PRICE_STARTER/GROWTH point at the new ids).
+    ("kerygma_starter_29_monthly", "Kerygma Starter", 2900, "usd"),
+    ("kerygma_growth_79_monthly", "Kerygma Growth", 7900, "usd"),
+    # Reference price only — see module docstring. Kept so a manual,
+    # self-serve-style Checkout link can still be generated for a
+    # customer who wants one, without inventing a new code path for it.
     ("kerygma_enterprise_monthly", "Kerygma Enterprise", 39900, "usd"),
 ]
 
@@ -156,8 +182,8 @@ def main() -> None:
         meter_env_vars[event_name] = (meter_id, price_id)
 
     print("\n--- Paste into .env ---")
-    print(f"STRIPE_PRICE_STARTER={plan_env_vars['kerygma_starter_monthly']}")
-    print(f"STRIPE_PRICE_GROWTH={plan_env_vars['kerygma_growth_monthly']}")
+    print(f"STRIPE_PRICE_STARTER={plan_env_vars['kerygma_starter_29_monthly']}")
+    print(f"STRIPE_PRICE_GROWTH={plan_env_vars['kerygma_growth_79_monthly']}")
     print(f"STRIPE_PRICE_ENTERPRISE={plan_env_vars['kerygma_enterprise_monthly']}")
     print(f"STRIPE_METER_TRANSCRIPTION_MINUTES=transcription_minutes")
     print(f"STRIPE_PRICE_TRANSCRIPTION_MINUTES={meter_env_vars['transcription_minutes'][1]}")

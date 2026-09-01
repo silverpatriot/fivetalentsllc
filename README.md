@@ -59,14 +59,20 @@ is worth it.
 
 ## Billing
 
-Hybrid: three flat monthly Stripe Prices (Starter/Growth/Enterprise —
-**$49/$149/$399 are explicit placeholders**, not a real pricing decision)
-plus two Stripe Billing Meters for overage (transcription minutes, AI
-generations). Built directly on Stripe's Billing Meters API rather than
-Metronome (the platform Stripe now steers new usage-based integrations
-toward) — Metronome is aimed at prepaid credits/enterprise
-contracts/dimensional pricing, overkill for two simple counters; revisit
-if pricing gets materially more complex.
+Four tiers — Free / Starter ($29) / Growth ($79) / Enterprise (custom,
+contact-sales, no self-serve Checkout) — each with its own included
+monthly AI-generation quota (app/services/plan_limits.py); Free and
+Enterprise's dollar figures aren't Stripe Prices at all (see
+activate_free_tier and Enterprise's mailto button in
+pricing-tiers.tsx). Starter/Growth are still flagged provisional — real
+numbers now (Phase 5), not the original $49/$149/$399 Phase 2
+placeholders, but not yet validated against real usage/margin data.
+Usage past a tier's included quota is metered via two Stripe Billing
+Meters (transcription minutes, AI generations) — built directly on
+Stripe's Billing Meters API rather than Metronome (the platform Stripe
+now steers new usage-based integrations toward) — Metronome is aimed at
+prepaid credits/enterprise contracts/dimensional pricing, overkill for
+two simple counters; revisit if pricing gets materially more complex.
 
 - `backend/scripts/stripe_setup.py` — idempotent bootstrap script that
   creates the Products/Prices/Meters. **Not run automatically** — it

@@ -1,14 +1,20 @@
 """Checkout (new subscription) and Customer Portal (self-serve plan
 changes/cancellation) session creation. Both hand off to Stripe-hosted
 pages — no custom payment form or billing-management UI, per Task 2.
+
+Free (see activate_free_tier below) is deliberately NOT a Checkout
+tier — PLAN_TIERS here is specifically "tiers that go through Stripe",
+not "every valid plan_tier value" (that fuller set only matters to
+app/services/plan_limits.py's quota table).
 """
 from typing import Annotated
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.deps import get_current_tenant
+from app.core.deps import get_current_tenant, get_raw_db
 from app.models import Tenant
 from app.schemas.billing import (
     PLAN_TIERS,
@@ -16,6 +22,7 @@ from app.schemas.billing import (
     CheckoutSessionRead,
     PortalSessionRead,
 )
+from app.schemas.tenant import TenantRead
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 settings = get_settings()
@@ -96,3 +103,31 @@ async def create_portal_session(
         return_url=f"{settings.frontend_url}/billing",
     )
     return PortalSessionRead(portal_url=session.url)
+
+
+@router.post("/activate-free", response_model=TenantRead)
+async def activate_free_tier(
+    tenant: Annotated[Tenant, Depends(get_current_tenant)],
+    db: Annotated[AsyncSession, Depends(get_raw_db)],
+) -> Tenant:
+    """No Stripe involved, deliberately — the entire point of a free tier
+    is not asking for a card. plan_tier='free' is already Tenant's own
+    server_default (migration 0001), so this only ever needs to move
+    subscription_status: 'pending' (every tenant's starting state, see
+    app/api/webhooks_clerk.py) -> 'active'.
+
+    Restricted to 'pending' on purpose: an already-active PAID tenant
+    can't downgrade to free through this one-click endpoint — that's a
+    real decision (cancel via the Customer Portal, a support
+    conversation), not something this route should do as a side effect.
+    """
+    if tenant.subscription_status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Tenant is already {tenant.subscription_status!r} — activate-free only applies to a new signup",
+        )
+    tenant.plan_tier = "free"
+    tenant.subscription_status = "active"
+    await db.commit()
+    await db.refresh(tenant)
+    return tenant
