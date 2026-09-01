@@ -22,6 +22,7 @@ class TenantRead(TenantBase):
     subscription_status: str
     stripe_customer_id: str | None
     stripe_subscription_id: str | None
+    free_trial_started_at: datetime | None
     created_at: datetime
 
 

@@ -46,7 +46,7 @@ from app.services.context_assembly import (
 )
 from app.services.ingestion import ingest_text
 from app.services.openrouter import OpenRouterError, chat_completion, stream_chat_completion
-from app.services.plan_limits import is_ai_generation_within_quota
+from app.services.plan_limits import has_cadence_access, is_within_sermon_quota
 from app.tasks.usage_reporting import record_usage_event
 
 logger = logging.getLogger(__name__)
@@ -60,16 +60,20 @@ def _sse(event: str, data: dict) -> bytes:
 async def _record_llm_call(
     tenant_id: uuid.UUID, sermon_id: uuid.UUID, stage: GenerationStage, outcome: str
 ) -> None:
-    """One usage_events row per real LLM call — outline and draft each
-    record their own, independently, regardless of success/failure. This
-    is the raw ledger of what actually happened (Phase 3 completion
-    review's decision), and billable is the actual billing decision
-    (Phase 5): a failed call is never billable — it produced nothing, so
-    it can't be overage — and only counts against the tenant's plan-tier
-    quota (app/services/plan_limits.py) when it succeeded. Within that
-    quota: billable=False (included in the flat monthly price). Past it:
-    billable=True, reported to Stripe's metered ai_generations price —
-    see app/tasks/usage_reporting.py.
+    """One usage_events row per real LLM call — outline, draft, and
+    outline_condense each record their own, independently, regardless of
+    success/failure. This is the raw ledger of what actually happened
+    (Phase 3 completion review's decision); billable is the actual
+    billing decision (Phase 5), and only DRAFT rows ever carry it:
+
+    A completed sermon (one DRAFT succeeding) is the metered unit — see
+    app/services/plan_limits.py's is_within_sermon_quota. OUTLINE is a
+    sub-step of that same sermon, not a second billable thing, and
+    OUTLINE_CONDENSE (regenerating a preaching outline afterward) is a
+    free follow-up on a sermon already accounted for — neither stage
+    checks quota; both always record billable=False. A failed DRAFT is
+    also never billable — it produced no sermon, so it can't be overage,
+    and doesn't consume the tenant's quota either.
 
     A metering hiccup must never lose a generation that otherwise
     succeeded (or its error state) — same protective try/except as the
@@ -77,8 +81,8 @@ async def _record_llm_call(
     """
     try:
         billable = False
-        if outcome == "succeeded":
-            billable = not await run_in_threadpool(is_ai_generation_within_quota, tenant_id)
+        if stage == GenerationStage.DRAFT and outcome == "succeeded":
+            billable = not await run_in_threadpool(is_within_sermon_quota, tenant_id)
         await run_in_threadpool(
             record_usage_event,
             tenant_id,
@@ -120,9 +124,11 @@ async def _run(
     sermon.status = "generating"
     await db.flush()
 
+    cadence_enabled = await run_in_threadpool(has_cadence_access, tenant_id)
     try:
         ctx = await assemble_context(
-            db, sermon, request.passage_reference, request.topic, request.translation
+            db, sermon, request.passage_reference, request.topic, request.translation,
+            cadence_enabled=cadence_enabled,
         )
     except Exception as exc:  # httpx/network errors reaching the Bible API, etc.
         logger.exception("Context assembly failed for sermon %s", sermon.id)
@@ -134,6 +140,7 @@ async def _run(
         {
             "scripture_resolved": ctx.scripture is not None,
             "cadence_example_count": len(ctx.cadence_examples),
+            "cadence_available": cadence_enabled,
             "web_result_count": len(ctx.web_results),
         },
     )

@@ -134,6 +134,8 @@ async def fetch_cadence_examples(
     passage_reference: str | None,
     topic: str | None,
     limit: int | None = None,
+    *,
+    cadence_enabled: bool = True,
 ) -> list[CadenceExample]:
     """The tenant's own cadence-corpus documents (past sermons — generated
     in Kerygma or uploaded, per Task 2) whose content is most similar
@@ -146,6 +148,14 @@ async def fetch_cadence_examples(
     on: a query embedding chosen to rank another tenant's document highest
     still can't see it, because RLS filters before ORDER BY ever runs.
 
+    cadence_enabled=False (app/services/plan_limits.py's
+    has_cadence_access — a Free tenant past its 30-day trial window)
+    short-circuits before the embedding call even happens: the tenant's
+    own generated sermons still went into the corpus regardless of
+    access (never thrown away), so if/when they upgrade, their existing
+    voice data is usable immediately — this just skips using it right
+    now, and skips paying for the embedding call to do so.
+
     dedupe_by_document=True: three chunks from the same one past sermon
     isn't three voice examples, it's one sermon shown three times — see
     app/services/retrieval.py's docstring.
@@ -154,6 +164,8 @@ async def fetch_cadence_examples(
     to "no examples this time" (logged) rather than failing the whole
     generation over what's an enhancement, not a hard requirement.
     """
+    if not cadence_enabled:
+        return []
     limit = limit or settings.cadence_example_count
     query_text = _cadence_query_text(sermon, passage_reference, topic)
     try:
@@ -202,9 +214,13 @@ async def assemble_context(
     passage_reference: str | None,
     topic: str | None,
     translation: str | None = None,
+    *,
+    cadence_enabled: bool = True,
 ) -> AssembledContext:
     scripture = await fetch_passage(passage_reference, translation) if passage_reference else None
-    cadence_examples = await fetch_cadence_examples(db, sermon, passage_reference, topic)
+    cadence_examples = await fetch_cadence_examples(
+        db, sermon, passage_reference, topic, cadence_enabled=cadence_enabled
+    )
     web_results = await fetch_web_context(passage_reference, topic)
     return AssembledContext(
         title=sermon.title,

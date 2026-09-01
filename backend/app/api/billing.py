@@ -7,6 +7,7 @@ tier — PLAN_TIERS here is specifically "tiers that go through Stripe",
 not "every valid plan_tier value" (that fuller set only matters to
 app/services/plan_limits.py's quota table).
 """
+from datetime import datetime, timezone
 from typing import Annotated
 
 import stripe
@@ -112,9 +113,14 @@ async def activate_free_tier(
 ) -> Tenant:
     """No Stripe involved, deliberately — the entire point of a free tier
     is not asking for a card. plan_tier='free' is already Tenant's own
-    server_default (migration 0001), so this only ever needs to move
+    server_default (migration 0001), so this mostly just moves
     subscription_status: 'pending' (every tenant's starting state, see
-    app/api/webhooks_clerk.py) -> 'active'.
+    app/api/webhooks_clerk.py) -> 'active'. It also stamps
+    free_trial_started_at (migration 0011) — the clock
+    app/services/plan_limits.py's has_cadence_access reads to know when a
+    free tenant's 30-day full-cadence-tools window closes; deliberately
+    set HERE (the moment they actually choose free), not at tenant
+    creation, since a tenant can sit in 'pending' for a while first.
 
     Restricted to 'pending' on purpose: an already-active PAID tenant
     can't downgrade to free through this one-click endpoint — that's a
@@ -128,6 +134,7 @@ async def activate_free_tier(
         )
     tenant.plan_tier = "free"
     tenant.subscription_status = "active"
+    tenant.free_trial_started_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(tenant)
     return tenant

@@ -72,6 +72,7 @@ def test_activate_free_moves_a_pending_tenant_to_active_free(pending_tenant: dic
     assert body["plan_tier"] == "free"
     assert body["subscription_status"] == "active"
     assert body["stripe_customer_id"] is None  # no Stripe object was ever created for this
+    assert body["free_trial_started_at"] is not None  # starts the 30-day cadence-access clock
 
 
 def test_activate_free_refuses_an_already_active_paid_tenant(active_starter_tenant: dict, rsa_keypair, monkeypatch):

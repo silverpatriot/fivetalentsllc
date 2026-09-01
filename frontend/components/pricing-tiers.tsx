@@ -15,11 +15,21 @@ import { cn } from "@/lib/utils";
 // Checkout button below) and Free needs no dollar figure to track at
 // all — see app/api/billing.py's activate_free_tier.
 //
-// Quotas are app/services/plan_limits.py's PLAN_TIER_MONTHLY_AI_
-// GENERATIONS, kept in sync here by hand for now: one full sermon
-// (outline + draft) uses 2 of these, so "~N sermons" below is quota/2,
-// rounded down — regenerating a preaching outline afterward uses a
-// third.
+// Sermon counts are app/services/plan_limits.py's
+// PLAN_TIER_MONTHLY_SERMONS, kept in sync here by hand for now — one
+// unit = one completed sermon (outline + draft), not each individual
+// LLM call; regenerating a preaching outline afterward is free.
+//
+// Cadence-matching (voice-from-past-sermons) is two different things,
+// only one of which exists yet:
+//   - AI-generated-sermon matching: real today, gated by
+//     has_cadence_access. Starter+ get it permanently; Free gets it for
+//     30 days from activating the free plan, then loses it (keeps their
+//     sermon quota).
+//   - Real mp3/transcript matching: NOT built yet (no transcription
+//     pipeline exists) — marked "coming soon" on Growth below rather
+//     than claimed as live. Don't remove that qualifier until the
+//     pipeline is actually real.
 const TIERS = [
   {
     planTier: "free",
@@ -27,7 +37,12 @@ const TIERS = [
     name: "Free",
     price: "$0",
     blurb: "Try it with your own church, no card required.",
-    features: ["8 AI generations/mo (~4 sermons)", "Scripture-verified citations", "Compare & concordance tools"],
+    features: [
+      "4 sermons/mo",
+      "All cadence-matching tools for your first 30 days",
+      "Scripture-verified citations",
+      "Compare & concordance tools",
+    ],
     highlighted: false,
   },
   {
@@ -36,7 +51,7 @@ const TIERS = [
     name: "Starter",
     price: "$29",
     blurb: "One church, preaching weekly.",
-    features: ["40 AI generations/mo (~20 sermons)", "Everything in Free", "Matches your own past sermons' voice", "Email support"],
+    features: ["10 sermons/mo", "Everything in Free", "Matches your own past sermons' voice, ongoing", "Email support"],
     highlighted: false,
   },
   {
@@ -45,7 +60,13 @@ const TIERS = [
     name: "Growth",
     price: "$79",
     blurb: "Multiple campuses or a full media team.",
-    features: ["150 AI generations/mo (~75 sermons)", "Everything in Starter", "Multiple campus/team accounts", "Priority support"],
+    features: [
+      "25 sermons/mo",
+      "Everything in Starter",
+      "Voice-matching from real sermon recordings (coming soon)",
+      "Multiple campus/team accounts",
+      "Priority support",
+    ],
     highlighted: true,
   },
   {
@@ -54,7 +75,7 @@ const TIERS = [
     name: "Enterprise",
     price: "Custom",
     blurb: "Denominational networks and large multi-site churches.",
-    features: ["Unlimited AI generations", "Everything in Growth", "Custom onboarding", "Dedicated support"],
+    features: ["Unlimited sermons", "Everything in Growth", "Custom onboarding", "Dedicated support"],
     highlighted: false,
   },
 ] as const;

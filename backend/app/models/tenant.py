@@ -1,4 +1,6 @@
-from sqlalchemy import String
+from datetime import datetime
+
+from sqlalchemy import DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, CreatedAtMixin, UUIDPkMixin
@@ -21,3 +23,8 @@ class Tenant(Base, UUIDPkMixin, CreatedAtMixin):
     # created by the Clerk org-provisioning webhook exists in 'pending'
     # from the moment it's created, before Stripe Checkout ever happens.
     subscription_status: Mapped[str] = mapped_column(String(50), nullable=False, server_default="pending")
+    # Migration 0011 — set once, by app/api/billing.py's
+    # activate_free_tier, NOT tenants.created_at (see that migration's
+    # docstring for why). Null for any tenant that never activated free.
+    # app/services/plan_limits.py's has_cadence_access is the only reader.
+    free_trial_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
