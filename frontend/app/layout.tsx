@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Kerygma",
-  description: "AI-assisted sermon generation, transcription, and clip generation for churches.",
+  description: "AI-assisted sermon generation and transcription for churches.",
 };
 
 export default async function RootLayout({

@@ -1,9 +1,11 @@
 # Kerygma
 
-Multi-tenant SaaS for churches: AI-assisted sermon generation, media
-transcription, and clip generation. (Repo/package names still say
-`sermon-engine`/`sermon_engine` internally — only customer-facing surfaces
-use the Kerygma name.)
+Multi-tenant SaaS for churches: AI-assisted sermon generation and media
+transcription. (Repo/package names still say `sermon-engine`/`sermon_engine`
+internally — only customer-facing surfaces use the Kerygma name.)
+
+Clip generation is out of scope here — it's being built as a separate
+product, Cluos.
 
 ## Stack
 

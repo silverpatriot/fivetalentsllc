@@ -166,10 +166,10 @@ class Settings(BaseSettings):
     # How many of the tenant's past sermons to pull as cadence/voice
     # examples. Deliberately a plain recency query (ORDER BY created_at
     # DESC), NOT a pgvector similarity search over sermon_embeddings —
-    # real semantic cadence-matching is explicitly deferred alongside clip
-    # generation (see Phase 3 kickoff spec's stop line), since OpenRouter
-    # has no embeddings endpoint and populating sermon_embeddings would
-    # need a second LLM-provider key this phase doesn't have.
+    # real semantic cadence-matching is explicitly deferred (see Phase 3
+    # kickoff spec's stop line), since OpenRouter has no embeddings
+    # endpoint and populating sermon_embeddings would need a second
+    # LLM-provider key this phase doesn't have.
     cadence_example_count: int = 3
 
     # --- Tavily (live web search, folded into context assembly) ---
