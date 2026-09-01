@@ -58,6 +58,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      # Uploaded sermon audio (app/services/storage.py's LocalDiskStorage)
+      # — mounted here only. celery-worker/celery-beat never touch a raw
+      # upload directly (transcription runs inline in the request that
+      # receives it — see app/services/transcription.py's module
+      # docstring), so they have no reason to see this volume.
+      - media_storage:/app/media
     networks:
       - internal
     # Reached only over the internal network — by `frontend` (server-side
@@ -158,3 +165,4 @@ networks:
 
 volumes:
   postgres_data:
+  media_storage:
