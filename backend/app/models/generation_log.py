@@ -12,6 +12,11 @@ from app.models.base import Base, CreatedAtMixin, UUIDPkMixin, pg_enum
 class GenerationStage(str, enum.Enum):
     OUTLINE = "outline"
     DRAFT = "draft"
+    # Migration 0010 — the on-demand, post-manuscript outline-condensing
+    # pass (app/services/generation.py's generate_outline_from_manuscript),
+    # distinct from OUTLINE (the internal pre-draft pass every generation
+    # already ran, never persisted on its own).
+    OUTLINE_CONDENSE = "outline_condense"
 
 
 class GenerationLog(Base, UUIDPkMixin, CreatedAtMixin):

@@ -23,8 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_active_tenant_id, get_db
 from app.models.sermon import Sermon
 from app.schemas.generation import GenerateRequest
-from app.schemas.sermon import SermonCreate, SermonRead, SermonUpdate
-from app.services.generation import generate_sermon_stream
+from app.schemas.sermon import OutlineGenerateRequest, SermonCreate, SermonRead, SermonUpdate
+from app.services.generation import generate_outline_from_manuscript, generate_sermon_stream
+from app.services.openrouter import OpenRouterError
 
 router = APIRouter(prefix="/sermons", tags=["sermons"])
 
@@ -120,3 +121,30 @@ async def generate_sermon(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/{sermon_id}/outline", response_model=SermonRead)
+async def create_outline(
+    sermon_id: uuid.UUID,
+    body: OutlineGenerateRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    tenant_id: Annotated[uuid.UUID, Depends(get_active_tenant_id)],
+) -> Sermon:
+    """Condenses the sermon's already-generated manuscript into a
+    persisted, preachable outline — see
+    app/services/generation.py's generate_outline_from_manuscript.
+    A plain JSON response, not SSE: a single fast LLM call, not the
+    two-stage generate pipeline, so there's no reason for the
+    StreamingResponse/own-session complexity `generate_sermon` needs.
+    """
+    sermon = await _get_owned_sermon(db, sermon_id)
+    if sermon.content is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Generate a manuscript before creating an outline"
+        )
+    try:
+        await generate_outline_from_manuscript(db, tenant_id, sermon, body.translation)
+    except OpenRouterError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    await db.refresh(sermon)
+    return sermon

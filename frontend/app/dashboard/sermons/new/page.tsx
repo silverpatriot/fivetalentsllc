@@ -3,6 +3,14 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 const FORMATS = [
   { value: "expository", label: "Expository — verse-by-verse through a passage" },
@@ -44,28 +52,28 @@ export default function NewSermonPage() {
 
       <label className="flex flex-col gap-1.5 text-sm">
         Title
-        <input
+        <Input
           required
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          className="border-input rounded-lg border bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           placeholder="On the Love of God"
         />
       </label>
 
       <label className="flex flex-col gap-1.5 text-sm">
         Format
-        <select
-          value={format}
-          onChange={(e) => setFormat(e.target.value as typeof format)}
-          className="border-input rounded-lg border bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
-        >
-          {FORMATS.map((f) => (
-            <option key={f.value} value={f.value}>
-              {f.label}
-            </option>
-          ))}
-        </select>
+        <Select value={format} onValueChange={(v) => setFormat(v as typeof format)}>
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {FORMATS.map((f) => (
+              <SelectItem key={f.value} value={f.value}>
+                {f.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </label>
 
       {error && <p className="text-destructive text-sm">{error}</p>}

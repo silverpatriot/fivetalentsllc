@@ -29,6 +29,23 @@ class ReferenceType(str, enum.Enum):
     COMMENTARY = "commentary"
 
 
+# The single source of truth for which commentary source_ids exist and
+# their display names — scripts/ingest_baseline_corpus.py and
+# app/services/study.py both import this rather than each keeping their
+# own copy. All 7 are public-domain/CC0-marked commentaries confirmed
+# live at bible.helloao.org/api/available_commentaries.json (migration
+# 0008's docstring); matthew-henry is the only one ingested by default.
+COMMENTARY_LABELS: dict[str, str] = {
+    "matthew-henry": "Matthew Henry",
+    "adam-clarke": "Adam Clarke",
+    "jamieson-fausset-brown": "Jamieson-Fausset-Brown",
+    "john-calvin": "John Calvin",
+    "john-gill": "John Gill",
+    "keil-delitzsch": "Keil & Delitzsch",  # Old Testament only
+    "tyndale": "Tyndale Open Study Notes",
+}
+
+
 class ReferenceDocument(Base, UUIDPkMixin, CreatedAtMixin):
     __tablename__ = "reference_documents"
 
@@ -41,6 +58,13 @@ class ReferenceDocument(Base, UUIDPkMixin, CreatedAtMixin):
     # book names, which would be a second thing to keep correct rather
     # than trusting the source data as-is.
     passage_reference: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    # Which specific commentary this is (e.g. "matthew-henry", "adam-clarke")
+    # — migration 0008. Meaningful only for reference_type="commentary";
+    # cross_reference rows leave this NULL (it has nothing to distinguish —
+    # there's exactly one cross-reference source). See that migration's
+    # docstring for why this is a column here rather than a second
+    # ReferenceType per commentary.
+    source_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
 
 
 class ReferenceChunk(Base, UUIDPkMixin, CreatedAtMixin):

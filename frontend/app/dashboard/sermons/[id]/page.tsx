@@ -1,7 +1,10 @@
 "use client";
 
 import { use, useEffect, useRef, useState } from "react";
+import { Download, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { downloadText } from "@/lib/download";
 
 type Sermon = {
   id: string;
@@ -9,6 +12,12 @@ type Sermon = {
   format: string;
   status: string;
   content: string | null;
+  // Migration 0010 — a persisted, preachable outline condensed FROM
+  // `content` on demand (see handleCreateOutline below). Distinct from
+  // draftOutline (this component's own state, below): that one is the
+  // ephemeral pre-manuscript outline streamed during generation itself,
+  // never saved.
+  outline: string | null;
 };
 
 type CitationFlag = {
@@ -53,6 +62,14 @@ function CitationBadge({ flag }: { flag: CitationFlag }) {
   return (
     <div className={`rounded-lg px-2.5 py-1.5 text-xs ${style}`}>
       <span className="font-medium">{flag.reference}</span> — {flag.detail}
+      {/* flag.source_text is the real, verified scripture text
+          bible.verify_all_citations already resolved server-side — it
+          was being computed and sent every time but never rendered. */}
+      {flag.source_text && (
+        <blockquote className="text-muted-foreground mt-1 border-l-2 border-current/20 pl-2 italic">
+          {flag.source_text}
+        </blockquote>
+      )}
     </div>
   );
 }
@@ -67,10 +84,20 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
   const [topic, setTopic] = useState("");
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
-  const [outline, setOutline] = useState<string | null>(null);
+  // The ephemeral, pre-manuscript outline pass every generation runs
+  // internally (context_assembly.build_outline_messages) — streamed here
+  // for feedback during generation, never persisted on its own. NOT the
+  // same thing as sermon.outline (the new, real, saved preaching
+  // outline) — kept under a clearly distinct name so the two don't
+  // collide in this component the way they used to share one "outline"
+  // name before that field existed.
+  const [draftOutline, setDraftOutline] = useState<string | null>(null);
   const [draftText, setDraftText] = useState("");
   const [citations, setCitations] = useState<CitationFlag[] | null>(null);
   const draftRef = useRef("");
+
+  const [creatingOutline, setCreatingOutline] = useState(false);
+  const [outlineError, setOutlineError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch(`/api/sermons/${id}`)
@@ -86,7 +113,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
     e.preventDefault();
     setGenerating(true);
     setGenError(null);
-    setOutline(null);
+    setDraftOutline(null);
     setDraftText("");
     setCitations(null);
     draftRef.current = "";
@@ -116,7 +143,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
         buffer = rest;
         for (const frame of frames) {
           if (frame.event === "outline") {
-            setOutline((frame.data as { text: string }).text);
+            setDraftOutline((frame.data as { text: string }).text);
           } else if (frame.event === "delta") {
             draftRef.current += (frame.data as { text: string }).text;
             setDraftText(draftRef.current);
@@ -136,10 +163,38 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
     }
   }
 
+  async function handleCreateOutline() {
+    setCreatingOutline(true);
+    setOutlineError(null);
+    try {
+      const resp = await fetch(`/api/sermons/${id}/outline`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        throw new Error(data?.detail ? String(data.detail) : `Could not create outline (${resp.status})`);
+      }
+      setSermon(await resp.json());
+    } catch (err) {
+      setOutlineError(err instanceof Error ? err.message : "Could not create outline");
+    } finally {
+      setCreatingOutline(false);
+    }
+  }
+
   if (loadError) return <p className="text-destructive text-sm">{loadError}</p>;
-  if (!sermon) return <p className="text-muted-foreground text-sm">Loading…</p>;
+  if (!sermon) {
+    return (
+      <p className="text-muted-foreground flex items-center gap-1.5 text-sm">
+        <Loader2 className="size-4 animate-spin" /> Loading…
+      </p>
+    );
+  }
 
   const flaggedCount = citations?.filter((c) => c.status !== "verified").length ?? 0;
+  const manuscript = draftText || sermon.content;
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
@@ -155,21 +210,15 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
           <h2 className="text-sm font-semibold">Generate</h2>
           <label className="flex flex-col gap-1.5 text-sm">
             Scripture passage (optional)
-            <input
+            <Input
               value={passageReference}
               onChange={(e) => setPassageReference(e.target.value)}
               placeholder="Philippians 4:11-13"
-              className="border-input rounded-lg border bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
             />
           </label>
           <label className="flex flex-col gap-1.5 text-sm">
             Topic (optional if a passage is given)
-            <input
-              value={topic}
-              onChange={(e) => setTopic(e.target.value)}
-              placeholder="Contentment"
-              className="border-input rounded-lg border bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
-            />
+            <Input value={topic} onChange={(e) => setTopic(e.target.value)} placeholder="Contentment" />
           </label>
           <Button type="submit" disabled={generating || (!passageReference && !topic)}>
             {generating ? "Generating…" : "Generate sermon"}
@@ -181,20 +230,64 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
         <div className="bg-destructive/10 text-destructive rounded-lg p-3 text-sm">{genError}</div>
       )}
 
-      {outline && (
+      {draftOutline && (
         <div>
           <h2 className="text-sm font-semibold">Outline</h2>
-          <pre className="text-muted-foreground mt-1 whitespace-pre-wrap text-sm">{outline}</pre>
+          <pre className="text-muted-foreground mt-1 whitespace-pre-wrap text-sm">{draftOutline}</pre>
         </div>
       )}
 
-      {(draftText || sermon.content) && (
+      {manuscript && (
         <div>
-          <h2 className="text-sm font-semibold">Draft</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold">Draft</h2>
+            {sermon.content && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => downloadText(`${sermon.title}.md`, sermon.content ?? "")}
+              >
+                <Download /> Download manuscript
+              </Button>
+            )}
+          </div>
           <div className="mt-1 whitespace-pre-wrap text-sm leading-relaxed">
-            {draftText || sermon.content}
+            {manuscript}
             {generating && <span className="animate-pulse">▍</span>}
           </div>
+        </div>
+      )}
+
+      {/* Preachable outline (migration 0010) — on-demand, condensed FROM
+          the manuscript above, actually persisted (sermon.outline), not
+          the ephemeral pre-manuscript pass shown as "Outline" above. */}
+      {sermon.content && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold">Preaching outline</h2>
+            <div className="flex gap-2">
+              {sermon.outline && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => downloadText(`${sermon.title} - Outline.md`, sermon.outline ?? "")}
+                >
+                  <Download /> Download outline
+                </Button>
+              )}
+              <Button size="sm" variant="outline" onClick={handleCreateOutline} disabled={creatingOutline}>
+                {creatingOutline ? "Creating…" : sermon.outline ? "Regenerate outline" : "Create outline"}
+              </Button>
+            </div>
+          </div>
+          <p className="text-muted-foreground text-xs">
+            Condensed from the manuscript above for actually preaching from — main points, key phrases, and
+            scripture quoted in full, not the full manuscript text.
+          </p>
+          {outlineError && <p className="text-destructive text-sm">{outlineError}</p>}
+          {sermon.outline && (
+            <div className="rounded-lg border p-4 text-sm whitespace-pre-wrap">{sermon.outline}</div>
+          )}
         </div>
       )}
 

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useOrganization, Show } from "@clerk/nextjs";
 import Link from "next/link";
+import { Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -130,9 +131,12 @@ export function PricingTiers() {
             </p>
             <p className="text-muted-foreground mt-1 text-xs">{tier.blurb}</p>
           </div>
-          <ul className="text-muted-foreground flex flex-1 flex-col gap-1 text-xs">
+          <ul className="text-muted-foreground flex flex-1 flex-col gap-1.5 text-xs">
             {tier.features.map((f) => (
-              <li key={f}>· {f}</li>
+              <li key={f} className="flex items-start gap-1.5">
+                <Check className="text-primary mt-0.5 size-3.5 shrink-0" />
+                {f}
+              </li>
             ))}
           </ul>
           <CheckoutButton planTier={tier.planTier} highlighted={tier.highlighted} />

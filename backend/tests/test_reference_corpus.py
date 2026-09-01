@@ -136,6 +136,106 @@ async def test_search_reference_corpus_is_not_gated_by_tenant_context(seeded_ref
     assert [r.document_id for r in results_a] == [r.document_id for r in results_b]
 
 
+@pytest.fixture
+def seeded_multi_commentary(pg_engine: Engine) -> Iterator[dict]:
+    """Two DIFFERENT commentaries (source_id), sharing the same
+    passage_reference — the exact scenario migration 0008's widened
+    UNIQUE(reference_type, passage_reference, source_id) constraint
+    exists to allow. Proves both (a) the constraint actually permits this
+    (the insert would fail outright against the old 2-column constraint)
+    and (b) source_id-filtered search returns only the matching one."""
+    marker = uuid.uuid4().hex[:8]
+    shared_ref = f"TEST-{marker}-John 3"
+    henry_text = "Matthew Henry: Nicodemus came by night, cautious but sincere in his inquiry."
+    clarke_text = "Adam Clarke: The Pharisee's nocturnal visit reflects both fear and genuine curiosity."
+
+    async def _seed():
+        async with tenant_session(uuid.uuid4()) as db:
+            henry_vector = await embed_text(henry_text)
+            clarke_vector = await embed_text(clarke_text)
+
+            henry_doc = ReferenceDocument(
+                reference_type=ReferenceType.COMMENTARY.value, title=f"Matthew Henry: {shared_ref}",
+                passage_reference=shared_ref, source_id="matthew-henry",
+            )
+            db.add(henry_doc)
+            await db.flush()
+            db.add(
+                ReferenceChunk(
+                    reference_type=ReferenceType.COMMENTARY.value, reference_document_id=henry_doc.id,
+                    chunk_index=0, content=henry_text, embedding=henry_vector,
+                )
+            )
+
+            clarke_doc = ReferenceDocument(
+                reference_type=ReferenceType.COMMENTARY.value, title=f"Adam Clarke: {shared_ref}",
+                passage_reference=shared_ref, source_id="adam-clarke",
+            )
+            db.add(clarke_doc)
+            await db.flush()
+            db.add(
+                ReferenceChunk(
+                    reference_type=ReferenceType.COMMENTARY.value, reference_document_id=clarke_doc.id,
+                    chunk_index=0, content=clarke_text, embedding=clarke_vector,
+                )
+            )
+            await db.flush()
+            return {"henry_doc_id": str(henry_doc.id), "clarke_doc_id": str(clarke_doc.id)}
+
+    ids = asyncio.run(_seed())
+    yield ids
+    with pg_engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM reference_documents WHERE id = :id1 OR id = :id2"),
+                     {"id1": ids["henry_doc_id"], "id2": ids["clarke_doc_id"]})
+
+
+async def test_two_commentaries_can_share_a_passage_reference(seeded_multi_commentary):
+    """The fixture itself succeeding (no unique-constraint violation on
+    insert) is the assertion that matters most here — this would raise
+    on the OLD 2-column constraint. Also confirm both rows are genuinely
+    there under their own distinct source_id."""
+    async with tenant_session(uuid.uuid4()) as db:
+        henry_results = await search_reference_corpus(
+            db, ReferenceType.COMMENTARY.value, await embed_text("Nicodemus visiting at night"), limit=10,
+            source_id="matthew-henry",
+        )
+        clarke_results = await search_reference_corpus(
+            db, ReferenceType.COMMENTARY.value, await embed_text("Nicodemus visiting at night"), limit=10,
+            source_id="adam-clarke",
+        )
+    assert any(r.document_id == seeded_multi_commentary["henry_doc_id"] for r in henry_results)
+    assert any(r.document_id == seeded_multi_commentary["clarke_doc_id"] for r in clarke_results)
+
+
+async def test_search_reference_corpus_source_id_filter_excludes_other_sources(seeded_multi_commentary):
+    query_vector = await embed_text("Nicodemus visiting at night")
+    async with tenant_session(uuid.uuid4()) as db:
+        henry_only = await search_reference_corpus(
+            db, ReferenceType.COMMENTARY.value, query_vector, limit=10, source_id="matthew-henry"
+        )
+    assert not any(r.document_id == seeded_multi_commentary["clarke_doc_id"] for r in henry_only)
+    assert all(r.source_id == "matthew-henry" for r in henry_only if r.document_id == seeded_multi_commentary["henry_doc_id"])
+
+
+async def test_search_reference_corpus_no_source_id_filter_returns_both(seeded_multi_commentary):
+    """source_id=None (the default) — no filter applied — must return
+    both, matching pre-0008 unfiltered behavior. A generous limit, not
+    the usual production-sized one: this environment now has real,
+    live-ingested commentary (including real Adam Clarke/Matthew Henry
+    entries on John 3 itself, from this session's own smoke-test
+    ingests) that can legitimately outrank this fixture's synthetic
+    one-liner at a small top-K — this test is about unfiltered
+    multi-source presence, not ranking, so it isn't testing anything
+    weaker by asking for enough rows to not depend on today's exact
+    corpus size."""
+    query_vector = await embed_text("Nicodemus visiting at night")
+    async with tenant_session(uuid.uuid4()) as db:
+        both = await search_reference_corpus(db, ReferenceType.COMMENTARY.value, query_vector, limit=500)
+    doc_ids = {r.document_id for r in both}
+    assert seeded_multi_commentary["henry_doc_id"] in doc_ids
+    assert seeded_multi_commentary["clarke_doc_id"] in doc_ids
+
+
 async def test_reference_documents_and_chunks_have_no_tenant_id_column(pg_engine: Engine):
     """A schema-level guarantee, not just a behavioral one — confirms
     the design decision actually landed in the database, not just that

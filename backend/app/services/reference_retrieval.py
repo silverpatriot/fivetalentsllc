@@ -29,11 +29,18 @@ class ReferenceChunkResult:
     passage_reference: str | None
     content: str
     distance: float
+    source_id: str | None = None
 
 
 async def search_reference_corpus(
-    db: AsyncSession, reference_type: str, query_vector: list[float], limit: int
+    db: AsyncSession, reference_type: str, query_vector: list[float], limit: int, source_id: str | None = None
 ) -> list[ReferenceChunkResult]:
+    """source_id (migration 0008) narrows to one specific commentary when
+    given, e.g. "adam-clarke" — meaningless for reference_type=
+    cross_reference (there's only ever one cross-reference source), so
+    callers there simply never pass it. Left unset, every matching row is
+    returned regardless of source, which is exactly today's pre-0008
+    behavior for any caller not yet updated to pick sources explicitly."""
     distance = ReferenceChunk.embedding.cosine_distance(query_vector).label("distance")
     stmt = (
         select(
@@ -42,12 +49,14 @@ async def search_reference_corpus(
             distance,
             ReferenceDocument.title,
             ReferenceDocument.passage_reference,
+            ReferenceDocument.source_id,
         )
         .join(ReferenceDocument, ReferenceDocument.id == ReferenceChunk.reference_document_id)
         .where(ReferenceChunk.reference_type == reference_type)
-        .order_by(distance)
-        .limit(limit)
     )
+    if source_id is not None:
+        stmt = stmt.where(ReferenceDocument.source_id == source_id)
+    stmt = stmt.order_by(distance).limit(limit)
     rows = (await db.execute(stmt)).all()
     return [
         ReferenceChunkResult(
@@ -56,6 +65,7 @@ async def search_reference_corpus(
             passage_reference=r.passage_reference,
             content=r.content,
             distance=float(r.distance),
+            source_id=r.source_id,
         )
         for r in rows
     ]

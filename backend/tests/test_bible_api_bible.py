@@ -41,7 +41,7 @@ async def test_private_fetch_from_api_bible_returns_none_on_clean_not_found():
     api.bible "no such passage" is None, not an exception. Cross-checking
     that against bible-api.com is fetch_passage's job (see the tests
     below), not this function's."""
-    result = await bible._fetch_from_api_bible("Frobnitz 99:99", bible._API_BIBLE_IDS["kjv"])
+    result = await bible._fetch_from_api_bible("Frobnitz 99:99", bible.API_BIBLE_IDS["kjv"])
     assert result is None
 
 
@@ -57,10 +57,10 @@ async def test_fetch_passage_falls_back_to_bible_api_com_on_api_bible_failure(mo
 
 
 async def test_fetch_passage_uses_bible_api_com_for_a_translation_api_bible_doesnt_map():
-    # "bbe" (Bible in Basic English) isn't in _API_BIBLE_IDS — confirmed
+    # "bbe" (Bible in Basic English) isn't in API_BIBLE_IDS — confirmed
     # live that bible-api.com serves it, so this should go straight there
     # rather than to api.bible.
-    assert "bbe" not in bible._API_BIBLE_IDS
+    assert "bbe" not in bible.API_BIBLE_IDS
     passage = await bible.fetch_passage("John 3:16", "bbe")
     assert passage is not None
     assert passage.source == "bible-api.com"

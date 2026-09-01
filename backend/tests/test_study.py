@@ -23,6 +23,7 @@ from app.db.session import tenant_session
 from app.main import app
 from app.models.document import CorpusType, DocumentSource
 from app.services.ingestion import ingest_text
+from app.services.reference_retrieval import ReferenceChunkResult
 from tests.conftest import make_clerk_jwt
 
 client = TestClient(app)
@@ -73,6 +74,31 @@ async def _fake_chat_completion(model: str, messages: list[dict]) -> tuple[str, 
     return messages[1]["content"], '{"fake":"study-response"}'
 
 
+def _fake_reference_result(i: int) -> ReferenceChunkResult:
+    return ReferenceChunkResult(
+        document_id=f"fake-doc-{i}", title=f"Fake Commentary Entry {i}", passage_reference="Fake 1:1",
+        content=f"Fake commentary content {i}, isolated from any real ingested data.", distance=0.3,
+        source_id="matthew-henry",
+    )
+
+
+async def _isolated_reference_results(db, reference_type, query_vector, limit, source_id=None):
+    # 3 == MIN_OWN_RESULTS_BEFORE_WEB_SUPPLEMENT — enough that the
+    # thin-commentary Tavily trigger (added alongside the thin-own-docs
+    # one) doesn't fire just because these tests aren't about the
+    # reference corpus specifically. Fixed/fake, not real ingested
+    # content, for the same reason _isolate_from_reference_corpus always
+    # isolated to something rather than real data: real content grows
+    # over time and would make these counts/citations flaky. Only for
+    # "commentary" — cross_reference stays empty, since no test here
+    # exercises or asserts on cross-reference behavior specifically, and
+    # returning fake data for it would inflate citation counts these
+    # tests don't expect.
+    if reference_type != "commentary":
+        return []
+    return [_fake_reference_result(i) for i in range(3)]
+
+
 async def _no_reference_results(*a, **k):
     return []
 
@@ -84,7 +110,19 @@ def _isolate_from_reference_corpus(monkeypatch):
     test_reference_corpus.py, and — being real, live, growing data any
     query might incidentally match — would otherwise make these tests'
     exact citation counts and used_* flags depend on whatever happens to
-    be ingested in this environment at the time."""
+    be ingested in this environment at the time). Isolated to a fixed,
+    non-thin fake result set (not empty) — empty would itself now read as
+    "commentary is thin" and trigger the Tavily-on-thin-commentary path
+    these tests aren't testing; see _isolate_from_reference_corpus_empty
+    for the one test that specifically wants nothing from any source."""
+    monkeypatch.setattr("app.services.study.search_reference_corpus", _isolated_reference_results)
+
+
+def _isolate_from_reference_corpus_empty(monkeypatch):
+    """Only for test_query_with_neither_source_available_does_not_call_the_llm_or_fabricate
+    — that test's whole point is "genuinely nothing from any source", so
+    it needs the true-empty isolation _isolate_from_reference_corpus no
+    longer provides."""
     monkeypatch.setattr("app.services.study.search_reference_corpus", _no_reference_results)
 
 
@@ -114,8 +152,17 @@ def test_query_with_own_documents_only_when_corpus_covers_it(
     body = resp.json()
     assert body["used_own_documents"] is True
     assert body["used_web_search"] is False
-    assert len(body["citations"]) == 4
-    assert all(c["source_type"] == "document" for c in body["citations"])
+    # 4 real document citations + the 3 fake, non-thin commentary results
+    # _isolate_from_reference_corpus now returns (isolated from real
+    # reference-corpus content, but not empty — see that helper's own
+    # docstring for why empty would wrongly read as "commentary is thin"
+    # and trigger the Tavily-on-thin-commentary path this test isn't
+    # about).
+    doc_citations = [c for c in body["citations"] if c["source_type"] == "document"]
+    commentary_citations = [c for c in body["citations"] if c["source_type"] == "commentary"]
+    assert len(doc_citations) == 4
+    assert len(commentary_citations) == 3
+    assert len(body["citations"]) == 7
     assert "YOUR DOCUMENTS" in body["answer"]  # the echoed prompt — proves real grounding content was built
     assert "grace" in body["answer"].lower()
 
@@ -147,7 +194,7 @@ def test_query_with_neither_source_available_does_not_call_the_llm_or_fabricate(
     async def _no_web_results(*a, **k):
         return []
 
-    _isolate_from_reference_corpus(monkeypatch)
+    _isolate_from_reference_corpus_empty(monkeypatch)
     monkeypatch.setattr("app.services.study.chat_completion", _chat_boom)
     monkeypatch.setattr("app.services.study.search_context", _no_web_results)
 
@@ -236,3 +283,107 @@ def test_query_includes_reference_corpus_results(active_tenant: dict, auth_heade
     assert body["used_own_documents"] is False
     assert any(c["source_type"] == "commentary" for c in body["citations"])
     assert "MATTHEW HENRY" in body["answer"]  # the echoed prompt — proves the section was actually populated
+
+
+def test_query_with_multiple_commentary_sources_grouped_separately(active_tenant: dict, auth_headers: dict, monkeypatch):
+    """Two distinct commentary_sources selected — their results must show
+    up as two separately-labeled sections/citation groups, never blended
+    into one, per this module's own "never blend sources" discipline."""
+
+    async def _no_web_results(*a, **k):
+        return []
+
+    async def _per_source_results(db, reference_type, query_vector, limit, source_id=None):
+        if reference_type != "commentary":
+            return []
+        if source_id == "matthew-henry":
+            return [_fake_reference_result(0)]
+        if source_id == "adam-clarke":
+            return [
+                ReferenceChunkResult(
+                    document_id="fake-clarke-0", title="Fake Adam Clarke Entry", passage_reference="Fake 1:1",
+                    content="Fake Adam Clarke commentary content.", distance=0.3, source_id="adam-clarke",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr("app.services.study.search_reference_corpus", _per_source_results)
+    monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
+    monkeypatch.setattr("app.services.study.search_context", _no_web_results)
+
+    resp = client.post(
+        "/study/query",
+        json={"question": "What does this passage mean?", "commentary_sources": ["matthew-henry", "adam-clarke"]},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    commentary_citations = [c for c in body["citations"] if c["source_type"] == "commentary"]
+    assert {c["commentary_source"] for c in commentary_citations} == {"matthew-henry", "adam-clarke"}
+    # Each source got its own labeled section in the prompt (using its
+    # real display name from COMMENTARY_LABELS, e.g. "Matthew Henry" —
+    # not its hyphenated source_id) — not blended into one generic
+    # "COMMENTARY" header.
+    assert "MATTHEW HENRY'S COMMENTARY" in body["answer"].upper()
+    assert "ADAM CLARKE'S COMMENTARY" in body["answer"].upper()
+
+
+def test_query_commentary_sources_none_preserves_prior_unfiltered_behavior(
+    active_tenant: dict, auth_headers: dict, monkeypatch
+):
+    """Regression guard: omitting commentary_sources entirely must behave
+    exactly like it did before migration 0008 introduced multiple
+    commentaries — a single unfiltered query, grouped by whatever
+    source_id the results actually carry (existing rows all backfilled to
+    matthew-henry)."""
+
+    async def _no_web_results(*a, **k):
+        return []
+
+    async def _unfiltered_results(db, reference_type, query_vector, limit, source_id=None):
+        assert source_id is None  # the actual behavior under test: no filter applied
+        if reference_type != "commentary":
+            return []
+        return [_fake_reference_result(0), _fake_reference_result(1), _fake_reference_result(2)]
+
+    monkeypatch.setattr("app.services.study.search_reference_corpus", _unfiltered_results)
+    monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
+    monkeypatch.setattr("app.services.study.search_context", _no_web_results)
+
+    resp = client.post("/study/query", json={"question": "What is grace?"}, headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    commentary_citations = [c for c in body["citations"] if c["source_type"] == "commentary"]
+    assert len(commentary_citations) == 3
+    assert all(c["commentary_source"] == "matthew-henry" for c in commentary_citations)
+
+
+def test_query_tavily_fires_when_commentary_thin_even_if_own_docs_sufficient(
+    pg_engine: Engine, active_tenant: dict, auth_headers: dict, synchronous_embedding, monkeypatch
+):
+    """The new trigger this session added: previously only thin OWN
+    documents supplemented with Tavily. Now thin COMMENTARY results do
+    too, independently — proven here by having plenty of own documents
+    (which alone would have kept Tavily silent before) while commentary
+    is isolated to empty."""
+    _isolate_from_reference_corpus_empty(monkeypatch)
+    monkeypatch.setattr("app.services.study.chat_completion", _fake_chat_completion)
+
+    for i in range(4):
+        resp = client.post(
+            "/documents",
+            files={"file": (f"doc{i}.txt", io.BytesIO(f"Notes about grace and justification, entry {i}. ".encode() * 10), "text/plain")},
+            data={"corpus_type": "theology", "title": f"Notes {i}"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201, resp.text
+    synchronous_embedding()
+
+    resp = client.post("/study/query", json={"question": "What is grace?"}, headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["used_own_documents"] is True
+    # Real Tavily call (TAVILY_API_KEY is configured in this environment)
+    # — fired because commentary was thin, even though own documents alone
+    # were sufficient.
+    assert body["used_web_search"] is True

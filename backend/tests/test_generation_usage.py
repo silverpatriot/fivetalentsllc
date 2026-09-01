@@ -203,6 +203,73 @@ def test_generate_records_a_failed_usage_event_when_outline_errors(
     assert sermon_row.content is None
 
 
+def test_create_outline_persists_and_records_generation_log(
+    pg_engine: Engine, active_tenant_with_org: dict, auth_headers: dict, monkeypatch
+):
+    """POST /sermons/{id}/outline on a sermon that already has a
+    manuscript: persists sermon.outline (never happened before migration
+    0010 — the old internal outline pass was thrown away), records its
+    own GenerationLog(stage=OUTLINE_CONDENSE), and appends the real
+    verified scripture text for every reference the condensed outline
+    cites (Genesis 1:1's real KJV text, checked against bible-api.com for
+    real here, same live-citation-verification convention as the rest of
+    this file — only the OpenRouter chat_completion call is mocked)."""
+    tenant_id = active_tenant_with_org["id"]
+    monkeypatch.setattr("app.services.generation.chat_completion", _fake_chat_completion)
+    monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream_chat_completion)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.ingestion.embed_document_chunks.delay", lambda *a, **k: None)
+
+    create_resp = client.post(
+        "/sermons", json={"title": "On the Creation", "format": "expository"}, headers=auth_headers
+    )
+    sermon_id = create_resp.json()["id"]
+    gen_resp = client.post(
+        f"/sermons/{sermon_id}/generate", json={"passage_reference": "Genesis 1:1"}, headers=auth_headers
+    )
+    assert gen_resp.status_code == 200, gen_resp.text
+
+    async def _fake_condense(model, messages):
+        # Cites a real, resolvable reference — proves the appended
+        # "Scripture Referenced" block carries genuine, verified text,
+        # not just that persistence works at all.
+        return "I. The beginning\n   - God created the heavens and the earth (Genesis 1:1)", '{"fake":"condense"}'
+
+    monkeypatch.setattr("app.services.generation.chat_completion", _fake_condense)
+
+    outline_resp = client.post(f"/sermons/{sermon_id}/outline", json={}, headers=auth_headers)
+    assert outline_resp.status_code == 200, outline_resp.text
+    body = outline_resp.json()
+    assert "Genesis 1:1" in body["outline"]
+    assert "## Scripture Referenced" in body["outline"]
+    assert "In the beginning God created the heaven and the earth" in body["outline"]  # real KJV text
+
+    with pg_engine.begin() as conn:
+        set_tenant(conn, tenant_id)
+        sermon_row = conn.execute(
+            sa.text("SELECT outline FROM sermons WHERE id = :id"), {"id": sermon_id}
+        ).fetchone()
+        log_rows = conn.execute(
+            sa.text("SELECT stage FROM generation_logs WHERE tenant_id = :tid AND sermon_id = :sid"),
+            {"tid": str(tenant_id), "sid": sermon_id},
+        ).fetchall()
+
+    assert sermon_row.outline is not None
+    assert "Genesis 1:1" in sermon_row.outline
+    assert {row.stage for row in log_rows} == {"outline", "draft", "outline_condense"}
+
+
+def test_create_outline_rejects_a_sermon_with_no_manuscript_yet(
+    active_tenant_with_org: dict, auth_headers: dict
+):
+    create_resp = client.post("/sermons", json={"title": "Not Generated Yet", "format": "topical"}, headers=auth_headers)
+    sermon_id = create_resp.json()["id"]
+
+    resp = client.post(f"/sermons/{sermon_id}/outline", json={}, headers=auth_headers)
+    assert resp.status_code == 400
+    assert "manuscript" in resp.json()["detail"].lower()
+
+
 def test_generate_requires_active_subscription(pg_engine: Engine, rsa_keypair, monkeypatch):
     """get_active_tenant_id's 402 gate applies to /generate the same as
     every other product route — a pending tenant can't call it, exactly

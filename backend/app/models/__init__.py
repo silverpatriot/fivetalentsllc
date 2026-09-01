@@ -1,6 +1,7 @@
 """Import every model here so Alembic's autogenerate (and Base.metadata in
 general) sees the full schema from a single import of app.models."""
 from app.models.base import Base
+from app.models.bible_verse import BibleVerse
 from app.models.clip import Clip
 from app.models.document import CorpusType, Document, DocumentChunk, DocumentSource, DocumentStatus
 from app.models.generation_log import GenerationLog, GenerationStage
@@ -25,6 +26,7 @@ __all__ = [
     "DocumentSource",
     "DocumentStatus",
     "MediaFile",
+    "BibleVerse",
     "ReferenceDocument",
     "ReferenceChunk",
     "ReferenceType",

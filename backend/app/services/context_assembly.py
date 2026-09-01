@@ -319,3 +319,28 @@ def build_draft_messages(ctx: AssembledContext, outline_text: str) -> list[dict[
         "it as scripture or as your own original thought."
     )
     return [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": user}]
+
+
+# Deliberately a SEPARATE system prompt from _SYSTEM_PROMPT above, not a
+# reuse of it — that one references SCRIPTURE/CADENCE EXAMPLES/FORMAT
+# INSTRUCTIONS/SUPPLEMENTARY WEB CONTEXT sections that don't exist here;
+# this pass receives only the already-finished manuscript, nothing else.
+_CONDENSE_SYSTEM_PROMPT = (
+    "You are helping a pastor turn an already-written, already-approved sermon manuscript into "
+    "a preachable outline — something they can actually preach FROM, not read verbatim. Produce "
+    "main points and sub-points with key phrases and transitions written out in enough detail to "
+    "speak from, but NOT the full manuscript prose. Whenever the manuscript cites scripture, "
+    "carry that reference into the outline EXACTLY as given (e.g. \"Romans 8:28\") — cite it by "
+    "reference only, never re-quote or paraphrase the verse text yourself; the exact source text "
+    "will be attached to each reference afterward from the verified Bible text, not from your own "
+    "memory of it."
+)
+
+
+def build_condense_outline_messages(manuscript_text: str) -> list[dict[str, str]]:
+    user = (
+        f"## APPROVED MANUSCRIPT\n{manuscript_text}\n\n"
+        "Condense this into a preachable outline: main points and sub-points, key phrases and "
+        "transitions spelled out, scripture cited by reference only (not quoted)."
+    )
+    return [{"role": "system", "content": _CONDENSE_SYSTEM_PROMPT}, {"role": "user", "content": user}]

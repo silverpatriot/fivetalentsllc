@@ -51,6 +51,14 @@ export default async function DashboardLayout({ children }: { children: React.Re
             <Link href="/dashboard/study" className="hover:text-foreground text-muted-foreground">
               Study
             </Link>
+            {/* Same pattern — Compare and Concordance are their own
+                standalone features, not nested under Study or Sermons. */}
+            <Link href="/dashboard/compare" className="hover:text-foreground text-muted-foreground">
+              Compare
+            </Link>
+            <Link href="/dashboard/concordance" className="hover:text-foreground text-muted-foreground">
+              Concordance
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-3">

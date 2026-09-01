@@ -7,26 +7,31 @@ licensed sources, confirmed reachable before building this:
     (~340K weighted verse-pair rows, CC-BY, TSK-derived). Grouped by
     "From Verse" into one reference_document per source verse, listing
     its cross-referenced passages by vote count.
-  - Commentary: bible.helloao.org's API, Matthew Henry Bible Commentary
-    (CC0-marked). One reference_document per (book, chapter), one chunk
-    per commentary entry (Matthew Henry comments in verse RANGES, not
+  - Commentary: bible.helloao.org's API — 7 public-domain/CC0-marked
+    commentaries available at the identical API shape (COMMENTARY_LABELS
+    below; --commentary-id picks one, default matthew-henry). One
+    reference_document per (book, chapter) per commentary, one chunk per
+    commentary entry (these commentaries comment in verse RANGES, not
     verse-by-verse — each entry is already a natural chunk boundary;
     chunk_text further splits only an unusually long entry).
 
 NOT run by anything automatically — this populates shared, cross-tenant
 content, run deliberately, same category as scripts/stripe_setup.py.
-Upserts on (reference_type, passage_reference) (migration 0007's unique
-constraint), so re-running is safe and replaces existing entries rather
-than accumulating duplicates.
+Upserts on (reference_type, passage_reference, source_id) (migration
+0008's unique constraint — widened from 0007's 2-column version
+specifically so multiple commentaries can coexist), so re-running is
+safe and replaces existing entries rather than accumulating duplicates.
 
 Bounded/testable runs, not just "ingest everything or nothing" — the
-full corpus is ~31K cross-reference groups and ~1200 commentary chapters,
-which costs real embedding-API time/spend; --book and --limit let you
-verify the pipeline on a small slice before committing to the full run:
+full corpus is ~31K cross-reference groups and up to ~1200 commentary
+chapters PER commentary, which costs real embedding-API time/spend;
+--book and --limit let you verify the pipeline on a small slice before
+committing to a full run:
 
     python scripts/ingest_baseline_corpus.py --source commentary --book JHN --limit 5
+    python scripts/ingest_baseline_corpus.py --source commentary --commentary-id adam-clarke --book JHN --limit 5
     python scripts/ingest_baseline_corpus.py --source cross-references --book Gen --limit 20
-    python scripts/ingest_baseline_corpus.py --source all   # the real, full run — expect it to take a while
+    python scripts/ingest_baseline_corpus.py --source all   # matthew-henry + cross-references, the full run
 """
 import argparse
 import io
@@ -41,13 +46,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 sys.path.insert(0, ".")  # run from backend/, matches this repo's other scripts/alembic
 
 from app.db.session import SyncSessionLocal  # noqa: E402
-from app.models.reference import ReferenceChunk, ReferenceDocument, ReferenceType  # noqa: E402
+from app.models.reference import COMMENTARY_LABELS, ReferenceChunk, ReferenceDocument, ReferenceType  # noqa: E402
 from app.services.chunking import chunk_text  # noqa: E402
 from app.services.embeddings import embed_batch_sync  # noqa: E402
 
 CROSS_REFERENCES_URL = "https://a.openbible.info/data/cross-references.zip"
 HELLOAO_BASE = "https://bible.helloao.org/api"
-COMMENTARY_ID = "matthew-henry"
 
 # Top N cross-references kept per source verse, by vote count — the raw
 # dataset has some verses with dozens of weak (low-vote) matches; keeping
@@ -67,12 +71,25 @@ def _readable_reference(raw: str) -> str:
     return f"{book} {chapter}:{verse}"
 
 
-def _upsert_document(session, *, reference_type: str, title: str, passage_reference: str | None) -> ReferenceDocument:
+def _upsert_document(
+    session, *, reference_type: str, title: str, passage_reference: str | None, source_id: str | None = None
+) -> ReferenceDocument:
     stmt = (
         pg_insert(ReferenceDocument)
-        .values(reference_type=reference_type, title=title, passage_reference=passage_reference)
+        .values(reference_type=reference_type, title=title, passage_reference=passage_reference, source_id=source_id)
         .on_conflict_do_update(
-            index_elements=[ReferenceDocument.reference_type, ReferenceDocument.passage_reference],
+            # 3-column conflict target — migration 0008 widened the unique
+            # constraint this upserts against from (reference_type,
+            # passage_reference) specifically so multiple commentaries can
+            # each have their own row for the same passage_reference. This
+            # MUST match that constraint exactly, or a second commentary's
+            # ingest fails loudly on the first conflicting row rather than
+            # upserting correctly — see that migration's docstring.
+            index_elements=[
+                ReferenceDocument.reference_type,
+                ReferenceDocument.passage_reference,
+                ReferenceDocument.source_id,
+            ],
             set_={"title": title},
         )
         .returning(ReferenceDocument.id)
@@ -149,8 +166,8 @@ def ingest_cross_references(*, book_filter: str | None, limit: int | None) -> in
     return count
 
 
-def _commentary_books(client: httpx.Client, book_filter: str | None) -> list[dict]:
-    resp = client.get(f"{HELLOAO_BASE}/c/{COMMENTARY_ID}/books.json", timeout=30)
+def _commentary_books(client: httpx.Client, commentary_id: str, book_filter: str | None) -> list[dict]:
+    resp = client.get(f"{HELLOAO_BASE}/c/{commentary_id}/books.json", timeout=30)
     resp.raise_for_status()
     books = resp.json()["books"]
     if book_filter:
@@ -158,17 +175,18 @@ def _commentary_books(client: httpx.Client, book_filter: str | None) -> list[dic
     return books
 
 
-def ingest_commentary(*, book_filter: str | None, limit: int | None) -> int:
+def ingest_commentary(*, commentary_id: str, book_filter: str | None, limit: int | None) -> int:
+    label = COMMENTARY_LABELS[commentary_id]
     count = 0
     with httpx.Client() as client, SyncSessionLocal() as session:
-        books = _commentary_books(client, book_filter)
-        print(f"Ingesting commentary for {len(books)} book(s)...")
+        books = _commentary_books(client, commentary_id, book_filter)
+        print(f"Ingesting {label}'s commentary for {len(books)} book(s)...")
         for book in books:
             num_chapters = book["numberOfChapters"]
             for chapter_num in range(1, num_chapters + 1):
                 if limit is not None and count >= limit:
                     return count
-                resp = client.get(f"{HELLOAO_BASE}/c/{COMMENTARY_ID}/{book['id']}/{chapter_num}.json", timeout=30)
+                resp = client.get(f"{HELLOAO_BASE}/c/{commentary_id}/{book['id']}/{chapter_num}.json", timeout=30)
                 if resp.status_code != 200:
                     continue
                 chapter = resp.json()["chapter"]
@@ -180,8 +198,9 @@ def ingest_commentary(*, book_filter: str | None, limit: int | None) -> int:
                 doc = _upsert_document(
                     session,
                     reference_type=ReferenceType.COMMENTARY.value,
-                    title=f"Matthew Henry: {passage_reference}",
+                    title=f"{label}: {passage_reference}",
                     passage_reference=passage_reference,
+                    source_id=commentary_id,
                 )
 
                 texts: list[str] = []
@@ -201,6 +220,12 @@ def ingest_commentary(*, book_filter: str | None, limit: int | None) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", choices=["cross-references", "commentary", "all"], default="all")
+    parser.add_argument(
+        "--commentary-id",
+        choices=list(COMMENTARY_LABELS),
+        default="matthew-henry",
+        help="Which commentary to ingest when --source is commentary/all (default: matthew-henry)",
+    )
     parser.add_argument("--book", default=None, help="Filter to one book (e.g. 'Gen' for cross-refs, 'JHN' for commentary — different id formats per source)")
     parser.add_argument("--limit", type=int, default=None, help="Cap the number of documents processed, for a bounded test run")
     args = parser.parse_args()
@@ -209,7 +234,7 @@ def main() -> None:
     if args.source in ("cross-references", "all"):
         total += ingest_cross_references(book_filter=args.book, limit=args.limit)
     if args.source in ("commentary", "all"):
-        total += ingest_commentary(book_filter=args.book, limit=args.limit)
+        total += ingest_commentary(commentary_id=args.commentary_id, book_filter=args.book, limit=args.limit)
     print(f"Done — {total} reference document(s) ingested/updated.")
 
 

@@ -27,6 +27,7 @@ Either way, verify_citation below never trusts the model's memory of
 scripture text — every reference is checked against whichever source
 actually answered.
 """
+import asyncio
 import difflib
 import logging
 import re
@@ -38,16 +39,70 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# A small, hand-picked map of translation code -> api.bible bibleId,
-# resolved live from GET /v1/bibles?language=eng rather than guessed.
-# Not a general catalog browser — just enough to make "more translations
-# through api.bible's catalog" real without building a full lookup UI.
-# Anything not in this map (or when BIBLE_API_KEY isn't configured) goes
-# straight to bible-api.com, which accepts an arbitrary translation code.
-_API_BIBLE_IDS: dict[str, str] = {
+# Every English translation confirmed live against GET /v1/bibles?language=eng
+# with this app's actual BIBLE_API_KEY to ACTUALLY return real passage text
+# (not just appear in the catalog listing — catalog presence alone doesn't
+# mean the key is licensed to fetch that translation's content; verified by
+# hitting /search then /passages/{id} for each and checking real text came
+# back). Of 40 English entries in that catalog, 33 returned real text and 7
+# were confirmed blocked (search itself returns nothing — no license) and
+# are deliberately excluded: the Brenton Septuagint (both editions), JPS
+# TaNaKH 1917, Targum Onkelos Etheridge, The Orthodox Jewish Bible, and the
+# World Messianic Bible (both editions). Of the 33 accessible entries, several
+# are multiple bibleIds for the literal same translation (e.g. WEB had 4
+# near-identical catalog rows) — deduped to one id per distinct translation
+# below, 21 total. Anything not in this map (or when BIBLE_API_KEY isn't
+# configured) goes straight to bible-api.com, which accepts an arbitrary
+# translation code.
+API_BIBLE_IDS: dict[str, str] = {
+    "amp": "a81b73293d3080c9-01",  # Amplified Bible
+    "bsb": "bba9f40183526463-01",  # Berean Standard Bible
+    "engkjvcpb": "55212e3cf5d04d49-01",  # Cambridge Paragraph Bible of the KJV
+    "engdra": "179568874c45066f-01",  # Douay-Rheims American 1899
+    "fbv": "65eec8e0b60e656b-01",  # Free Bible Version
+    "enggnv": "c315fa9f71d4af3a-01",  # Geneva Bible
     "kjv": "de4e12af7f28f599-01",  # King James (Authorised) Version
+    "lsv": "01b29f4b342acc35-01",  # Literal Standard Version
+    "niv11": "78a9f6124f344018-01",  # New International Version 2011
+    "nlt": "d6e14a625393b4da-01",  # New Living Translation
+    "nltce": "b907c8622b59a1f7-01",  # New Living Translation Catholic Edition
+    "nltuk": "43e315b442a7c862-01",  # New Living Translation, Anglicised
+    "engrv": "40072c4a5aba4022-01",  # Revised Version 1885
+    "engf35": "2f0fd81d7b85b923-01",  # English NT According to Family 35
     "asv": "06125adad2d5898a-01",  # American Standard Version
+    "tcent": "32339cf2f720ff8e-01",  # Text-Critical English New Testament
+    "t4t": "66c22495370cdfc0-01",  # Translation for Translators
     "web": "9879dbb7cfe39e4d-01",  # World English Bible
+    "webbe": "7142879509583d59-01",  # World English Bible British Edition
+    "engwebu": "72f4e6dc683324df-01",  # World English Bible Updated
+    "engwebus": "32664dc3288a28df-01",  # World English Bible, American English Edition, without Strong's Numbers
+}
+
+# Human-readable display names for the picker in the comparison UI —
+# GET /bible/translations returns these paired with the codes above so the
+# frontend never hardcodes its own copy of this list.
+TRANSLATION_LABELS: dict[str, str] = {
+    "amp": "Amplified Bible",
+    "bsb": "Berean Standard Bible",
+    "engkjvcpb": "Cambridge Paragraph Bible of the KJV",
+    "engdra": "Douay-Rheims American 1899",
+    "fbv": "Free Bible Version",
+    "enggnv": "Geneva Bible",
+    "kjv": "King James Version",
+    "lsv": "Literal Standard Version",
+    "niv11": "New International Version",
+    "nlt": "New Living Translation",
+    "nltce": "New Living Translation, Catholic Edition",
+    "nltuk": "New Living Translation, Anglicised",
+    "engrv": "Revised Version 1885",
+    "engf35": "English NT According to Family 35",
+    "asv": "American Standard Version",
+    "tcent": "Text-Critical English New Testament",
+    "t4t": "Translation for Translators",
+    "web": "World English Bible",
+    "webbe": "World English Bible, British Edition",
+    "engwebu": "World English Bible Updated",
+    "engwebus": "World English Bible, American English Edition",
 }
 
 
@@ -178,7 +233,7 @@ async def fetch_passage(reference: str, translation: str | None = None) -> Scrip
 
     Prefers api.bible (see _fetch_from_api_bible) when BIBLE_API_KEY is
     configured AND the requested translation is one of the handful
-    api.bible ids this app knows about (_API_BIBLE_IDS):
+    api.bible ids this app knows about (API_BIBLE_IDS):
       - api.bible resolves the reference -> that's the answer, returned
         directly.
       - api.bible SERVICE fails (ApiBibleError: network error, non-2xx,
@@ -192,7 +247,7 @@ async def fetch_passage(reference: str, translation: str | None = None) -> Scrip
         None.
     """
     effective_translation = (translation or settings.bible_translation).lower()
-    bible_id = _API_BIBLE_IDS.get(effective_translation)
+    bible_id = API_BIBLE_IDS.get(effective_translation)
 
     if not (settings.bible_api_key and bible_id):
         return await _fetch_from_bible_api_com(reference, effective_translation)
@@ -217,6 +272,18 @@ async def fetch_passage(reference: str, translation: str | None = None) -> Scrip
             reference,
         )
     return cross_check
+
+
+async def fetch_passage_multi(reference: str, translations: list[str]) -> dict[str, ScripturePassage | None]:
+    """The comparison-view seam: the same reference in N translations at
+    once. Deliberately a thin fan-out over the existing, unmodified
+    fetch_passage — one call per translation, concurrently — rather than a
+    new fetch codepath; _fetch_from_api_bible/_fetch_from_bible_api_com and
+    everything sermon generation depends on (context_assembly.py,
+    generation.py) are untouched by this function existing.
+    """
+    results = await asyncio.gather(*(fetch_passage(reference, t) for t in translations))
+    return dict(zip(translations, results))
 
 
 def extract_citations(text: str) -> list[str]:

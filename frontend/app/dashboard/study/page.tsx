@@ -11,6 +11,8 @@
 // sermon generation's "supplementary web context" section.
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
 
 type StudyDocument = {
   id: string;
@@ -20,6 +22,8 @@ type StudyDocument = {
   created_at: string;
 };
 
+type CommentaryOption = { id: string; label: string };
+
 type StudyCitation = {
   source_type: "document" | "commentary" | "cross_reference" | "web";
   label: string;
@@ -27,6 +31,7 @@ type StudyCitation = {
   excerpt: string;
   document_id: string | null;
   url: string | null;
+  commentary_source: string | null;
 };
 
 type StudyAnswer = {
@@ -52,13 +57,32 @@ export default function StudyPage() {
   const [queryError, setQueryError] = useState<string | null>(null);
   const [result, setResult] = useState<StudyAnswer | null>(null);
 
+  const [commentaries, setCommentaries] = useState<CommentaryOption[] | null>(null);
+  const [selectedCommentaries, setSelectedCommentaries] = useState<string[]>([]);
+
   async function loadDocuments() {
     const resp = await fetch("/api/documents?corpus_type=theology");
     if (resp.ok) setDocuments(await resp.json());
   }
 
+  async function loadCommentaries() {
+    const resp = await fetch("/api/study/commentaries");
+    if (!resp.ok) return;
+    const data: { commentaries: CommentaryOption[] } = await resp.json();
+    setCommentaries(data.commentaries);
+    // Default to every ingested commentary selected — matches
+    // answer_question's own commentary_sources=None behavior (query
+    // whatever's ingested, unfiltered) until the pastor narrows it down.
+    setSelectedCommentaries(data.commentaries.map((c) => c.id));
+  }
+
+  function toggleCommentary(id: string) {
+    setSelectedCommentaries((prev) => (prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id]));
+  }
+
   useEffect(() => {
     loadDocuments();
+    loadCommentaries();
   }, []);
 
   async function handleUpload(e: React.FormEvent<HTMLFormElement>) {
@@ -106,7 +130,7 @@ export default function StudyPage() {
       const resp = await fetch("/api/study/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, commentary_sources: selectedCommentaries }),
       });
       if (!resp.ok) {
         // Same reasoning as handleUpload above — the error body isn't
@@ -123,14 +147,44 @@ export default function StudyPage() {
     }
   }
 
-  // Four distinct provenance groups, each rendered separately — never
-  // blended — matching study.py's own grounding-source labeling.
-  const CITATION_GROUPS: { sourceType: StudyCitation["source_type"]; heading: string }[] = [
-    { sourceType: "document", heading: "From your documents" },
-    { sourceType: "commentary", heading: "From Matthew Henry's Commentary (public domain, shared reference library)" },
-    { sourceType: "cross_reference", heading: "Cross-references (public domain, shared reference library)" },
-    { sourceType: "web", heading: "From live web search — not your own documents, unverified" },
-  ];
+  // Citation groups, each rendered separately — never blended — matching
+  // study.py's own grounding-source labeling. "commentary" isn't one
+  // fixed group any more: since multiple commentaries can be selected,
+  // it's split into one sub-group per distinct commentary_source actually
+  // present in the results, each with its own real display name.
+  function citationGroups(citations: StudyCitation[]): { key: string; heading: string; items: StudyCitation[] }[] {
+    const groups: { key: string; heading: string; items: StudyCitation[] }[] = [];
+
+    const docItems = citations.filter((c) => c.source_type === "document");
+    if (docItems.length > 0) groups.push({ key: "document", heading: "From your documents", items: docItems });
+
+    const commentaryItems = citations.filter((c) => c.source_type === "commentary");
+    const sourceIds = Array.from(new Set(commentaryItems.map((c) => c.commentary_source ?? "unknown")));
+    for (const sourceId of sourceIds) {
+      const label = commentaries?.find((c) => c.id === sourceId)?.label ?? sourceId;
+      groups.push({
+        key: `commentary-${sourceId}`,
+        heading: `From ${label}'s Commentary (public domain, shared reference library)`,
+        items: commentaryItems.filter((c) => (c.commentary_source ?? "unknown") === sourceId),
+      });
+    }
+
+    const xrefItems = citations.filter((c) => c.source_type === "cross_reference");
+    if (xrefItems.length > 0) {
+      groups.push({
+        key: "cross_reference",
+        heading: "Cross-references (public domain, shared reference library)",
+        items: xrefItems,
+      });
+    }
+
+    const webItems = citations.filter((c) => c.source_type === "web");
+    if (webItems.length > 0) {
+      groups.push({ key: "web", heading: "From live web search — not your own documents, unverified", items: webItems });
+    }
+
+    return groups;
+  }
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-8">
@@ -190,14 +244,29 @@ export default function StudyPage() {
       {/* --- Ask --- */}
       <section className="flex flex-col gap-3">
         <h2 className="text-sm font-semibold">Ask a question</h2>
+
+        {commentaries && commentaries.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-muted-foreground text-xs font-semibold tracking-wide uppercase">
+              Ground answers in
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {commentaries.map((c) => (
+                <button key={c.id} type="button" onClick={() => toggleCommentary(c.id)}>
+                  <Badge variant={selectedCommentaries.includes(c.id) ? "default" : "outline"}>{c.label}</Badge>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleAsk} className="flex flex-col gap-2">
-          <textarea
+          <Textarea
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             required
             rows={3}
             placeholder="What does this material say about justification by faith?"
-            className="border-input rounded-lg border bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           />
           <Button type="submit" disabled={asking} className="self-start">
             {asking ? "Thinking…" : "Ask"}
@@ -209,30 +278,26 @@ export default function StudyPage() {
           <div className="flex flex-col gap-4 rounded-lg border p-4">
             <p className="text-sm whitespace-pre-wrap">{result.answer}</p>
 
-            {CITATION_GROUPS.map(({ sourceType, heading }) => {
-              const items = result.citations.filter((c) => c.source_type === sourceType);
-              if (items.length === 0) return null;
-              return (
-                <div key={sourceType} className="flex flex-col gap-1.5">
-                  <h3 className="text-muted-foreground text-xs font-semibold tracking-wide uppercase">{heading}</h3>
-                  <ul className="flex flex-col gap-1.5">
-                    {items.map((c) => (
-                      <li key={c.label} className="text-xs">
-                        <span className="text-muted-foreground">{c.label}</span>{" "}
-                        {c.url ? (
-                          <a href={c.url} target="_blank" rel="noreferrer" className="font-medium hover:underline">
-                            {c.title}
-                          </a>
-                        ) : (
-                          <span className="font-medium">{c.title}</span>
-                        )}
-                        <p className="text-muted-foreground mt-0.5 line-clamp-2">{c.excerpt}</p>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              );
-            })}
+            {citationGroups(result.citations).map(({ key, heading, items }) => (
+              <div key={key} className="flex flex-col gap-1.5">
+                <h3 className="text-muted-foreground text-xs font-semibold tracking-wide uppercase">{heading}</h3>
+                <ul className="flex flex-col gap-1.5">
+                  {items.map((c) => (
+                    <li key={c.label} className="text-xs">
+                      <span className="text-muted-foreground">{c.label}</span>{" "}
+                      {c.url ? (
+                        <a href={c.url} target="_blank" rel="noreferrer" className="font-medium hover:underline">
+                          {c.title}
+                        </a>
+                      ) : (
+                        <span className="font-medium">{c.title}</span>
+                      )}
+                      <p className="text-muted-foreground mt-0.5 line-clamp-2">{c.excerpt}</p>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
           </div>
         )}
       </section>

@@ -26,7 +26,12 @@ class SermonRead(BaseModel):
     title: str
     format: SermonFormat
     content: str | None
+    outline: str | None
     status: str
     created_by: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+
+
+class OutlineGenerateRequest(BaseModel):
+    translation: str | None = Field(default=None, max_length=20)

@@ -27,6 +27,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
@@ -37,7 +38,12 @@ from app.models.sermon import Sermon
 from app.models.usage_event import UsageEventType
 from app.schemas.generation import GenerateRequest
 from app.services import bible
-from app.services.context_assembly import assemble_context, build_draft_messages, build_outline_messages
+from app.services.context_assembly import (
+    assemble_context,
+    build_condense_outline_messages,
+    build_draft_messages,
+    build_outline_messages,
+)
 from app.services.ingestion import ingest_text
 from app.services.openrouter import OpenRouterError, chat_completion, stream_chat_completion
 from app.tasks.usage_reporting import record_usage_event
@@ -225,3 +231,62 @@ async def _run(
     # Usage metering already happened per-LLM-call above (_record_llm_call
     # at the outline and draft steps) — nothing left to record here.
     yield _sse("done", {"sermon_id": str(sermon.id), "status": sermon.status, "flagged_citation_count": len(flagged)})
+
+
+async def generate_outline_from_manuscript(
+    db: AsyncSession, tenant_id: uuid.UUID, sermon: Sermon, translation: str | None = None
+) -> None:
+    """On-demand: condenses an ALREADY-generated manuscript (sermon.content)
+    into a persisted, preachable outline (sermon.outline) — distinct from
+    _run's internal pre-draft outline pass above, which is never saved.
+    Mutates `sermon` in place and flushes; the caller (app/api/sermons.py)
+    is responsible for having already confirmed sermon.content is not
+    None before calling this.
+
+    Unlike generate_sermon_stream, this accepts the route's normal
+    Depends(get_db) session directly rather than opening its own —
+    that generator's whole reason for owning its own session is the
+    StreamingResponse teardown-timing issue documented on its own
+    docstring above; this is a single synchronous JSON response, so the
+    injected session stays valid for the entire request, no workaround
+    needed.
+    """
+    messages = build_condense_outline_messages(sermon.content)
+    try:
+        outline_text, raw = await chat_completion(settings.openrouter_outline_model, messages)
+    except OpenRouterError:
+        logger.exception("Outline condensing failed for sermon %s", sermon.id)
+        await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE_CONDENSE, "failed")
+        raise
+
+    await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE_CONDENSE, "succeeded")
+
+    # Post-process, not a model-trust step: the condensing prompt already
+    # instructs the model to cite scripture by reference only (never
+    # re-quote it from memory — see context_assembly._CONDENSE_SYSTEM_PROMPT),
+    # and this appends the REAL verified text for each reference it cited,
+    # deterministically, the same "never trust the model's memory of
+    # scripture" principle app/services/bible.py's verify_citation exists
+    # for elsewhere in this app.
+    citation_flags = await bible.verify_all_citations(outline_text, translation)
+    effective_translation = (translation or settings.bible_translation).upper()
+    verified_lines = [
+        f"{f['reference']} ({effective_translation}): {f['source_text']}" for f in citation_flags if f["source_text"]
+    ]
+    full_outline = outline_text
+    if verified_lines:
+        full_outline += "\n\n## Scripture Referenced\n" + "\n".join(verified_lines)
+
+    db.add(
+        GenerationLog(
+            tenant_id=tenant_id,
+            sermon_id=sermon.id,
+            stage=GenerationStage.OUTLINE_CONDENSE,
+            model=settings.openrouter_outline_model,
+            prompt={"messages": messages},
+            raw_response=raw,
+            citation_flags=citation_flags,
+        )
+    )
+    sermon.outline = full_outline
+    await db.flush()
