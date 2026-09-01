@@ -185,6 +185,46 @@ class Settings(BaseSettings):
     # candidate tenant slug — see frontend/lib/tenant.ts.
     app_base_domain: str = "kerygma.church"
 
+    # --- Whisper transcription: Groq primary, OpenAI fallback ---
+    # See app/services/transcription.py's module docstring for the
+    # layering rationale (same shape as bible.py's api.bible + bible-
+    # api.com). Groq hosts whisper-large-v3-turbo — the cheapest, fastest
+    # hosted Whisper option, no GPU infra of our own to run. OpenAI's own
+    # Whisper API is the fallback for a genuine Groq outage/rejection.
+    #
+    # NEITHER confirmed live yet — both keys are blank until someone puts
+    # real ones in .env; do that (and re-check the file-size caps noted
+    # below against current provider docs) before trusting this beyond
+    # local dev. Every other external integration in this codebase
+    # (bible.py, openrouter.py, tavily) was held to "confirmed live
+    # before use"; this one hasn't cleared that bar.
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    whisper_model_groq: str = "whisper-large-v3-turbo"
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    whisper_model_openai: str = "whisper-1"
+    # Both providers document a 25MB cap on a direct multipart upload
+    # (unverified against a real account here — see above). A compressed
+    # 25-minute sermon (Phase 5's target preached length) comfortably
+    # fits under that (~12MB at 64kbps mp3); this is the backstop against
+    # a raw WAV or an unusually long recording blowing past it — same
+    # role as max_upload_size_bytes above, just for audio.
+    max_media_upload_size_bytes: int = 25 * 1024 * 1024
+
+    # --- Media storage (app/services/storage.py) ---
+    # "local": a Docker-managed named volume, mounted into `backend` only
+    # (see docker-compose.yml's media_storage volume) — the only
+    # implementation that actually exists right now.
+    # "google_drive" is reserved for a tenant mapping their own Drive
+    # folder instead of using our disk — selecting it raises clearly
+    # (GoogleDriveStorage) rather than pretending to work; see that
+    # class's docstring for what real support would still need (OAuth,
+    # a per-tenant encrypted refresh-token store, a folder picker, the
+    # Drive API's own upload/download calls).
+    media_storage_backend: str = "local"
+    media_storage_root: str = "/app/media"
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
