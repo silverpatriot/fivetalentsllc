@@ -145,6 +145,10 @@ async def create_outline(
     try:
         await generate_outline_from_manuscript(db, tenant_id, sermon, body.translation)
     except OpenRouterError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+        # exc's own str() carries the raw upstream detail (server-side
+        # logging only, via generate_outline_from_manuscript's
+        # logger.exception) — user_message is what's safe to put in a
+        # response a pastor actually sees.
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=exc.user_message) from exc
     await db.refresh(sermon)
     return sermon

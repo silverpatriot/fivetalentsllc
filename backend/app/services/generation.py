@@ -140,7 +140,10 @@ async def _run(
         logger.exception("Outline generation failed for sermon %s", sermon.id)
         sermon.status = "draft"
         await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "failed")
-        yield _sse("error", {"detail": str(exc)})
+        # logger.exception above has the raw upstream detail; the SSE
+        # event a pastor's browser actually renders gets the sanitized
+        # message instead — see OpenRouterError.user_message's docstring.
+        yield _sse("error", {"detail": exc.user_message})
         return
 
     await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "succeeded")
@@ -173,7 +176,7 @@ async def _run(
         logger.exception("Draft generation failed for sermon %s", sermon.id)
         sermon.status = "draft"
         await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "failed")
-        yield _sse("error", {"detail": str(exc)})
+        yield _sse("error", {"detail": exc.user_message})
         return
 
     await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "succeeded")
