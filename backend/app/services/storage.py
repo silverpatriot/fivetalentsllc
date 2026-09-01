@@ -21,6 +21,19 @@ none of which exist yet. Selecting it via MEDIA_STORAGE_BACKEND raises
 clearly instead of silently falling back to local disk or pretending to
 work — same "fail loud on missing config" convention as
 OpenRouterError/TranscriptionError for a missing API key.
+
+Why this stub exists at all, not just "maybe someday": Kerygma's stored
+recordings/uploads are the intended future content source for a separate,
+still-unbuilt social-clip-generation SaaS — clip generation was
+deliberately cut from Kerygma's own scope (see git history,
+"Drop clip generation from scope — moving to Cluos, a separate SaaS").
+Local disk under a Docker volume scoped to this backend container won't
+be reachable from that separate product's deployment, so a shared-access
+backend (Drive, object storage, or an internal API) will eventually be
+needed — Drive is simply the one sketched out here as a seam. This is
+not scope creep or dead code left over from clip generation being
+removed; no active integration work is happening now, and none should
+start until that second product is actually being built.
 """
 import os
 import uuid

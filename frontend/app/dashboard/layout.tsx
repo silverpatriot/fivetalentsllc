@@ -46,6 +46,12 @@ export default async function DashboardLayout({ children }: { children: React.Re
             <Link href="/dashboard/sermons" className="hover:text-foreground text-muted-foreground">
               Sermons
             </Link>
+            {/* Its own nav entry, sibling to Sermons — a recording can
+                exist before it's linked to any sermon (media_files.sermon_id
+                is nullable), so this isn't nested under Sermons either. */}
+            <Link href="/dashboard/recordings" className="hover:text-foreground text-muted-foreground">
+              Recordings
+            </Link>
             {/* Phase 4 Task 3: its own nav entry, sibling to Sermons —
                 not nested inside sermon generation. */}
             <Link href="/dashboard/study" className="hover:text-foreground text-muted-foreground">

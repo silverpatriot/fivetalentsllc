@@ -158,3 +158,81 @@ def test_upload_rejects_file_over_the_size_limit(active_tenant, auth_headers, mo
         headers=auth_headers,
     )
     assert resp.status_code == 413
+
+
+def _upload_one(auth_headers, filename="sermon.mp3", sermon_id=None):
+    data = {"sermon_id": str(sermon_id)} if sermon_id else {}
+    return client.post(
+        "/media",
+        files={"file": (filename, io.BytesIO(b"fake audio bytes"), "audio/mpeg")},
+        data=data,
+        headers=auth_headers,
+    )
+
+
+def test_list_media_returns_only_this_tenants_recordings_newest_first(
+    active_tenant, auth_headers, _local_storage_root, monkeypatch
+):
+    async def _fake_transcribe_audio(data: bytes, filename: str) -> TranscriptionResult:
+        return TranscriptionResult(text="hello", duration_seconds=10.0, source="groq")
+
+    monkeypatch.setattr("app.api.media.transcribe_audio", _fake_transcribe_audio)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    first = _upload_one(auth_headers, filename="first.mp3")
+    second = _upload_one(auth_headers, filename="second.mp3")
+    assert first.status_code == 201 and second.status_code == 201
+
+    resp = client.get("/media", headers=auth_headers)
+    assert resp.status_code == 200
+    filenames = [row["original_filename"] for row in resp.json()]
+    # Newest first — "second" was uploaded after "first".
+    assert filenames == ["second.mp3", "first.mp3"]
+
+
+def test_get_media_audio_streams_back_the_original_bytes(
+    active_tenant, auth_headers, _local_storage_root, monkeypatch
+):
+    async def _fake_transcribe_audio(data: bytes, filename: str) -> TranscriptionResult:
+        return TranscriptionResult(text="hello", duration_seconds=10.0, source="groq")
+
+    monkeypatch.setattr("app.api.media.transcribe_audio", _fake_transcribe_audio)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    upload = _upload_one(auth_headers)
+    media_id = upload.json()["id"]
+
+    resp = client.get(f"/media/{media_id}/audio", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.content == b"fake audio bytes"
+    assert resp.headers["content-type"] == "audio/mpeg"
+
+
+def test_get_media_audio_404s_for_an_unknown_id(active_tenant, auth_headers):
+    resp = client.get(f"/media/{uuid.uuid4()}/audio", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_delete_media_removes_the_row_and_the_file(active_tenant, auth_headers, _local_storage_root, monkeypatch):
+    async def _fake_transcribe_audio(data: bytes, filename: str) -> TranscriptionResult:
+        return TranscriptionResult(text="hello", duration_seconds=10.0, source="groq")
+
+    monkeypatch.setattr("app.api.media.transcribe_audio", _fake_transcribe_audio)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    upload = _upload_one(auth_headers)
+    body = upload.json()
+    stored_file = _local_storage_root / body["tenant_id"] / f"{body['id']}-sermon.mp3"
+    assert stored_file.is_file()
+
+    resp = client.delete(f"/media/{body['id']}", headers=auth_headers)
+    assert resp.status_code == 204
+    assert not stored_file.exists()
+
+    resp = client.get("/media", headers=auth_headers)
+    assert resp.json() == []
+
+
+def test_delete_media_404s_for_an_unknown_id(active_tenant, auth_headers):
+    resp = client.delete(f"/media/{uuid.uuid4()}", headers=auth_headers)
+    assert resp.status_code == 404
