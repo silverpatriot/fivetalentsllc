@@ -476,7 +476,18 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
       )}
 
       {citations && citations.length > 0 && (
-        <div className="flex flex-col gap-2">
+        // select-none: this panel is a read-only report, not part of the
+        // editable draft above — a selection made here can never become
+        // an edit's {start, end} target (handleManuscriptMouseUp is only
+        // ever bound to the manuscript div, a separate sibling subtree —
+        // see that handler's own comment), so a selection here would
+        // otherwise silently do nothing with no feedback at all. Making
+        // it genuinely unselectable is honest about that up front,
+        // rather than letting a pastor select text here, type an edit
+        // instruction, and have it fall through to auto-locate (or a
+        // stale prior selection) instead of what they thought they'd
+        // targeted.
+        <div className="flex flex-col gap-2 select-none">
           <h2 className="text-sm font-semibold">
             Scripture citations
             {flaggedCount > 0 && (

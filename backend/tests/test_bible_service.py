@@ -157,3 +157,29 @@ async def test_verify_citation_does_not_misattribute_a_distant_unrelated_quote()
     assert result["status"] == "not_quoted"
     assert result["quoted_text"] is None
     assert "hurt me" not in (result["detail"] or "")
+
+
+async def test_verify_citation_boundary_survives_a_quote_ending_sentence_across_a_paragraph_break():
+    """Regression: the exact real bug found live (2026-09-02, Phase 6
+    edit-testing on a real sermon), a second escape of the same class
+    the previous test already fixed. The FIRST fix (_sentence_span)
+    still used a bare "punctuation then whitespace" boundary regex —
+    which never matched a sentence ending mid-quote ('...out.”', a
+    closing curly quote sitting between the period and the whitespace).
+    That one missed boundary let the "same sentence" window silently
+    walk backward across an entire paragraph break into a wholly
+    unrelated quote from the PREVIOUS paragraph, on a real production
+    sermon, for the exact reference a pastor was actively trying to fix
+    — confirmed live: identical shape to this test's draft below, one
+    quote-ending sentence, then a paragraph break, then the reference in
+    its own unquoted sentence. Must resolve to not_quoted; must never
+    see the unrelated prior-paragraph quote at all."""
+    draft = (
+        'It says, "There is a way out."\n\n'
+        "Romans 8:28 gives us that way. It calls us to trust that God works all things "
+        "together for good."
+    )
+    result = await bible.verify_citation("Romans 8:28", draft)
+    assert result["status"] == "not_quoted"
+    assert result["quoted_text"] is None
+    assert "way out" not in (result["detail"] or "")

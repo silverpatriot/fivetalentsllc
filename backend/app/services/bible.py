@@ -300,7 +300,8 @@ def _normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", s.lower()).strip()
 
 
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_SENTENCE_END_RE = re.compile(r"[.!?][\"'’”)\]]*\s+")
+_PARAGRAPH_BREAK_RE = re.compile(r"\n\s*\n")
 
 
 def _sentence_span(text: str, idx: int) -> tuple[int, int]:
@@ -315,15 +316,40 @@ def _sentence_span(text: str, idx: int) -> tuple[int, int]:
     own got matched against a quotation two sentences and a paragraph
     break away, inside the old fixed 400-character window.
 
-    Boundaries are plain '.'/'!'/'?' followed by whitespace — not full
-    sentence segmentation, but a book/chapter:verse reference never
-    contains that punctuation, so it can't fool this into treating the
-    reference itself as a boundary."""
+    Two boundary types, whichever is closer wins on each side:
+
+    - _SENTENCE_END_RE: '.'/'!'/'?', optionally followed by closing
+      quote/paren characters, then whitespace. The quote-mark allowance
+      matters — confirmed live (2026-09-02): a sentence ending
+      mid-quote ('...out.”') was NOT recognized as a boundary by an
+      earlier version of this regex (bare "punctuation, then whitespace"
+      — no allowance for a quote mark in between), which let the
+      search window silently leak across a full paragraph
+      break into a completely unrelated quote from the PREVIOUS
+      paragraph — the exact same class of bug this function exists to
+      prevent, just not fully closed by the first pass at it. A
+      book/chapter:verse reference never contains this punctuation, so
+      it can't fool this into treating the reference itself as a
+      boundary.
+    - _PARAGRAPH_BREAK_RE: a blank line (two or more newlines, any
+      whitespace between). An unconditional hard stop regardless of
+      punctuation — belt-and-suspenders for a sentence that's missing
+      its terminal punctuation entirely (a heading, a truncated line):
+      a real paragraph break should never be crossed either way."""
     start = 0
-    for m in _SENTENCE_BOUNDARY_RE.finditer(text, 0, idx):
-        start = m.end()
-    match = _SENTENCE_BOUNDARY_RE.search(text, idx)
-    return start, (match.start() if match else len(text))
+    for m in _SENTENCE_END_RE.finditer(text, 0, idx):
+        start = max(start, m.end())
+    for m in _PARAGRAPH_BREAK_RE.finditer(text, 0, idx):
+        start = max(start, m.end())
+
+    end = len(text)
+    m = _SENTENCE_END_RE.search(text, idx)
+    if m:
+        end = min(end, m.start())
+    m = _PARAGRAPH_BREAK_RE.search(text, idx)
+    if m:
+        end = min(end, m.start())
+    return start, end
 
 
 def _extract_quoted_near(text: str, reference: str) -> str | None:
