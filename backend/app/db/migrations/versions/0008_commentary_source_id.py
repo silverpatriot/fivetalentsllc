@@ -28,9 +28,19 @@ UNIQUE(reference_type, passage_reference, source_id) — necessary because
 two different commentaries now legitimately share a passage_reference
 (e.g. both matthew-henry and adam-clarke have their own "John 3" row).
 Postgres treats NULL as distinct per row in a UNIQUE constraint (standard
-SQL semantics, not NULLS NOT DISTINCT here), so cross-reference rows —
-which all carry source_id IS NULL — are unaffected by this widening and
-remain free to coexist one-per-passage_reference exactly as before.
+SQL semantics, not NULLS NOT DISTINCT here) — cross-reference rows, which
+all carry source_id IS NULL, are unaffected by this widening.
+
+CORRECTION (migration 0013): the sentence this replaced claimed that
+meant cross-reference rows "remain free to coexist one-per-
+passage_reference exactly as before." That's backwards — NULL-distinct
+semantics mean the constraint never fires between two cross-reference
+rows at all, so nothing was ever enforcing "one per passage_reference"
+for them, and ON CONFLICT (which targets this same index) silently
+never matched either. Confirmed live: re-running cross-reference
+ingestion duplicated rows rather than upserting them. 0013 adds
+NULLS NOT DISTINCT to fix this — read that migration for the real
+constraint this table runs under today.
 scripts/ingest_baseline_corpus.py's upsert conflict target is updated to
 this 3-column list in the same change (see that script) — an upsert
 against the OLD 2-column list here would silently target the wrong

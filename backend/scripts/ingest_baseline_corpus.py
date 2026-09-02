@@ -18,20 +18,40 @@ licensed sources, confirmed reachable before building this:
 NOT run by anything automatically — this populates shared, cross-tenant
 content, run deliberately, same category as scripts/stripe_setup.py.
 Upserts on (reference_type, passage_reference, source_id) (migration
-0008's unique constraint — widened from 0007's 2-column version
-specifically so multiple commentaries can coexist), so re-running is
+0008's unique constraint, widened from 0007's 2-column version
+specifically so multiple commentaries can coexist, then migration 0013's
+NULLS NOT DISTINCT — required for the upsert to actually collide on
+cross-reference rows, which all carry source_id IS NULL; without it
+every re-run silently duplicated the whole cross-reference corpus rather
+than upserting it, confirmed live before 0013 shipped), so re-running is
 safe and replaces existing entries rather than accumulating duplicates.
 
 Bounded/testable runs, not just "ingest everything or nothing" — the
-full corpus is ~31K cross-reference groups and up to ~1200 commentary
-chapters PER commentary, which costs real embedding-API time/spend;
---book and --limit let you verify the pipeline on a small slice before
-committing to a full run:
+full corpus is ~29K cross-reference groups and ~7,366 commentary
+chapters total across all 7 sources, which costs real embedding-API
+time/spend; --book and --limit let you verify the pipeline on a small
+slice before committing to a full run:
 
-    python scripts/ingest_baseline_corpus.py --source commentary --book JHN --limit 5
+    python scripts/ingest_baseline_corpus.py --source commentary --commentary-id matthew-henry --book JHN --limit 5
     python scripts/ingest_baseline_corpus.py --source commentary --commentary-id adam-clarke --book JHN --limit 5
     python scripts/ingest_baseline_corpus.py --source cross-references --book Gen --limit 20
-    python scripts/ingest_baseline_corpus.py --source all   # matthew-henry + cross-references, the full run
+    python scripts/ingest_baseline_corpus.py --source all   # ALL 7 commentaries + cross-references — the real full run
+
+Omitting --commentary-id (the default) now means every commentary in
+COMMENTARY_LABELS, not just matthew-henry — --source all used to mean
+"matthew-henry + cross-references" specifically, which undersold what
+"all" said on the tin; pass --commentary-id explicitly (as the examples
+above do) to restrict a run to one source, same as before.
+
+Cross-reference embedding calls are batched (CROSS_REF_EMBED_BATCH_SIZE
+below) — one embed_batch_sync() call per batch of verse groups, not one
+per verse group. Pure transport optimization: same text per chunk, same
+chunk_index, same upsert semantics; confirmed live before this shipped
+that OpenRouter's embeddings endpoint returns bit-identical vectors for
+the same input whether it's embedded alone or alongside other inputs in
+one batched call (each input's embedding doesn't depend on what else is
+in the request) — see the batching change's own commit for that check.
+Commentary was already batched per-chapter and is unchanged.
 """
 import argparse
 import io
@@ -58,6 +78,14 @@ HELLOAO_BASE = "https://bible.helloao.org/api"
 # all of them would bury the strong ones in noise for both the embedding
 # and whatever an LLM does with the retrieved chunk.
 CROSS_REFS_PER_VERSE = 10
+
+# How many verse groups' texts go into one embed_batch_sync() call.
+# ~29K groups at one embedding call each (the original shape) is ~29K
+# sequential OpenRouter round-trips — measured live at ~0.3s each, so
+# ~2.5 hours dominated entirely by network latency, not token cost
+# (the tokens themselves cost cents). Batching cuts that to ~294 calls
+# for the same total tokens/$ — same content embedded, just fewer trips.
+CROSS_REF_EMBED_BATCH_SIZE = 100
 
 
 def _readable_reference(raw: str) -> str:
@@ -98,10 +126,13 @@ def _upsert_document(
     return session.get(ReferenceDocument, doc_id)
 
 
-def _upsert_chunks(session, *, reference_type: str, document_id, texts: list[str]) -> None:
-    if not texts:
-        return
-    vectors = embed_batch_sync(texts)
+def _insert_chunks_with_vectors(
+    session, *, reference_type: str, document_id, texts: list[str], vectors: list[list[float]]
+) -> None:
+    """The actual per-chunk upsert, split out from _upsert_chunks so a
+    caller that's already batched its own embed_batch_sync() call across
+    multiple documents (ingest_cross_references, below) can reuse this
+    without triggering a second embedding call."""
     for chunk_index, (text, vector) in enumerate(zip(texts, vectors)):
         stmt = pg_insert(ReferenceChunk).values(
             reference_type=reference_type,
@@ -115,6 +146,16 @@ def _upsert_chunks(session, *, reference_type: str, document_id, texts: list[str
             set_={"content": stmt.excluded.content, "embedding": stmt.excluded.embedding},
         )
         session.execute(stmt)
+
+
+def _upsert_chunks(session, *, reference_type: str, document_id, texts: list[str]) -> None:
+    """One document's worth of chunks, embedded in their own call — what
+    ingest_commentary uses (already one call per chapter, no further
+    batching needed there)."""
+    if not texts:
+        return
+    vectors = embed_batch_sync(texts)
+    _insert_chunks_with_vectors(session, reference_type=reference_type, document_id=document_id, texts=texts, vectors=vectors)
 
 
 def ingest_cross_references(*, book_filter: str | None, limit: int | None) -> int:
@@ -143,26 +184,45 @@ def ingest_cross_references(*, book_filter: str | None, limit: int | None) -> in
     if limit:
         from_verses = from_verses[:limit]
 
-    print(f"Ingesting {len(from_verses)} cross-reference groups...")
+    print(f"Ingesting {len(from_verses)} cross-reference groups "
+          f"(batched {CROSS_REF_EMBED_BATCH_SIZE} per embedding call)...")
     count = 0
     with SyncSessionLocal() as session:
-        for i, from_verse in enumerate(from_verses):
-            targets = sorted(groups[from_verse], key=lambda t: -t[1])[:CROSS_REFS_PER_VERSE]
-            readable_from = _readable_reference(from_verse)
-            body = "\n".join(f"- {_readable_reference(to)} ({votes} votes)" for to, votes in targets)
-            text = f"Cross-references for {readable_from}:\n{body}"
+        for batch_start in range(0, len(from_verses), CROSS_REF_EMBED_BATCH_SIZE):
+            batch = from_verses[batch_start : batch_start + CROSS_REF_EMBED_BATCH_SIZE]
 
-            doc = _upsert_document(
-                session,
-                reference_type=ReferenceType.CROSS_REFERENCE.value,
-                title=f"Cross-references: {readable_from}",
-                passage_reference=readable_from,
-            )
-            _upsert_chunks(session, reference_type=ReferenceType.CROSS_REFERENCE.value, document_id=doc.id, texts=[text])
+            docs = []
+            texts = []
+            for from_verse in batch:
+                targets = sorted(groups[from_verse], key=lambda t: -t[1])[:CROSS_REFS_PER_VERSE]
+                readable_from = _readable_reference(from_verse)
+                body = "\n".join(f"- {_readable_reference(to)} ({votes} votes)" for to, votes in targets)
+                text = f"Cross-references for {readable_from}:\n{body}"
+
+                doc = _upsert_document(
+                    session,
+                    reference_type=ReferenceType.CROSS_REFERENCE.value,
+                    title=f"Cross-references: {readable_from}",
+                    passage_reference=readable_from,
+                )
+                docs.append(doc)
+                texts.append(text)
+
+            # ONE embedding call for the whole batch — identical text per
+            # chunk to the unbatched version, just fewer OpenRouter
+            # round-trips (see CROSS_REF_EMBED_BATCH_SIZE's comment).
+            vectors = embed_batch_sync(texts)
+            for doc, text, vector in zip(docs, texts, vectors):
+                _insert_chunks_with_vectors(
+                    session,
+                    reference_type=ReferenceType.CROSS_REFERENCE.value,
+                    document_id=doc.id,
+                    texts=[text],
+                    vectors=[vector],
+                )
             session.commit()
-            count += 1
-            if (i + 1) % 25 == 0:
-                print(f"  {i + 1}/{len(from_verses)}...")
+            count += len(batch)
+            print(f"  {count}/{len(from_verses)}...")
     return count
 
 
@@ -223,18 +283,22 @@ def main() -> None:
     parser.add_argument(
         "--commentary-id",
         choices=list(COMMENTARY_LABELS),
-        default="matthew-henry",
-        help="Which commentary to ingest when --source is commentary/all (default: matthew-henry)",
+        default=None,
+        help="Restrict commentary ingestion to one source. Omit (the default) to ingest all "
+        f"{len(COMMENTARY_LABELS)} sources in COMMENTARY_LABELS — this used to default to "
+        "matthew-henry only, which meant --source all silently skipped the other 6.",
     )
     parser.add_argument("--book", default=None, help="Filter to one book (e.g. 'Gen' for cross-refs, 'JHN' for commentary — different id formats per source)")
-    parser.add_argument("--limit", type=int, default=None, help="Cap the number of documents processed, for a bounded test run")
+    parser.add_argument("--limit", type=int, default=None, help="Cap the number of documents processed per source, for a bounded test run")
     args = parser.parse_args()
 
     total = 0
     if args.source in ("cross-references", "all"):
         total += ingest_cross_references(book_filter=args.book, limit=args.limit)
     if args.source in ("commentary", "all"):
-        total += ingest_commentary(commentary_id=args.commentary_id, book_filter=args.book, limit=args.limit)
+        commentary_ids = [args.commentary_id] if args.commentary_id else list(COMMENTARY_LABELS)
+        for commentary_id in commentary_ids:
+            total += ingest_commentary(commentary_id=commentary_id, book_filter=args.book, limit=args.limit)
     print(f"Done — {total} reference document(s) ingested/updated.")
 
 

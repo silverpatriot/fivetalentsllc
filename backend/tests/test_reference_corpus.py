@@ -180,7 +180,12 @@ def seeded_multi_commentary(pg_engine: Engine) -> Iterator[dict]:
                 )
             )
             await db.flush()
-            return {"henry_doc_id": str(henry_doc.id), "clarke_doc_id": str(clarke_doc.id)}
+            return {
+                "henry_doc_id": str(henry_doc.id),
+                "clarke_doc_id": str(clarke_doc.id),
+                "henry_text": henry_text,
+                "clarke_text": clarke_text,
+            }
 
     ids = asyncio.run(_seed())
     yield ids
@@ -193,14 +198,24 @@ async def test_two_commentaries_can_share_a_passage_reference(seeded_multi_comme
     """The fixture itself succeeding (no unique-constraint violation on
     insert) is the assertion that matters most here — this would raise
     on the OLD 2-column constraint. Also confirm both rows are genuinely
-    there under their own distinct source_id."""
+    there under their own distinct source_id.
+
+    Queries with each row's OWN seeded text, not a generic paraphrase —
+    guarantees ~0 cosine distance to itself and so a top rank regardless
+    of how large or topically adjacent the rest of the corpus gets. A
+    shared generic query ("Nicodemus visiting at night") used to do this
+    job; it broke the moment this environment ingested real Matthew
+    Henry/Adam Clarke commentary on John 3 (the actual Nicodemus
+    passage) at full scale — real, more specific content legitimately
+    outranked this fixture's one-liner, which is the retrieval working
+    correctly, not a bug to route around with a wider search."""
     async with tenant_session(uuid.uuid4()) as db:
         henry_results = await search_reference_corpus(
-            db, ReferenceType.COMMENTARY.value, await embed_text("Nicodemus visiting at night"), limit=10,
+            db, ReferenceType.COMMENTARY.value, await embed_text(seeded_multi_commentary["henry_text"]), limit=10,
             source_id="matthew-henry",
         )
         clarke_results = await search_reference_corpus(
-            db, ReferenceType.COMMENTARY.value, await embed_text("Nicodemus visiting at night"), limit=10,
+            db, ReferenceType.COMMENTARY.value, await embed_text(seeded_multi_commentary["clarke_text"]), limit=10,
             source_id="adam-clarke",
         )
     assert any(r.document_id == seeded_multi_commentary["henry_doc_id"] for r in henry_results)
@@ -219,21 +234,27 @@ async def test_search_reference_corpus_source_id_filter_excludes_other_sources(s
 
 async def test_search_reference_corpus_no_source_id_filter_returns_both(seeded_multi_commentary):
     """source_id=None (the default) — no filter applied — must return
-    both, matching pre-0008 unfiltered behavior. A generous limit, not
-    the usual production-sized one: this environment now has real,
-    live-ingested commentary (including real Adam Clarke/Matthew Henry
-    entries on John 3 itself, from this session's own smoke-test
-    ingests) that can legitimately outrank this fixture's synthetic
-    one-liner at a small top-K — this test is about unfiltered
-    multi-source presence, not ranking, so it isn't testing anything
-    weaker by asking for enough rows to not depend on today's exact
-    corpus size."""
-    query_vector = await embed_text("Nicodemus visiting at night")
+    both, matching pre-0008 unfiltered behavior.
+
+    Two separate self-matching queries, not one shared generic phrase —
+    see test_two_commentaries_can_share_a_passage_reference's docstring
+    for why a generic query stopped being reliable once this environment
+    ingested the real, full-scale baseline corpus (real commentary on
+    the actual Nicodemus passage now legitimately outranks a synthetic
+    one-liner for anything short of an enormous, slow ANN search). Each
+    query still runs with source_id unset, so this still exercises the
+    real thing under test — that leaving source_id off doesn't drop
+    either source from the corpus, not that one shared query happens to
+    surface both at once."""
     async with tenant_session(uuid.uuid4()) as db:
-        both = await search_reference_corpus(db, ReferenceType.COMMENTARY.value, query_vector, limit=500)
-    doc_ids = {r.document_id for r in both}
-    assert seeded_multi_commentary["henry_doc_id"] in doc_ids
-    assert seeded_multi_commentary["clarke_doc_id"] in doc_ids
+        henry_side = await search_reference_corpus(
+            db, ReferenceType.COMMENTARY.value, await embed_text(seeded_multi_commentary["henry_text"]), limit=10
+        )
+        clarke_side = await search_reference_corpus(
+            db, ReferenceType.COMMENTARY.value, await embed_text(seeded_multi_commentary["clarke_text"]), limit=10
+        )
+    assert any(r.document_id == seeded_multi_commentary["henry_doc_id"] for r in henry_side)
+    assert any(r.document_id == seeded_multi_commentary["clarke_doc_id"] for r in clarke_side)
 
 
 async def test_reference_documents_and_chunks_have_no_tenant_id_column(pg_engine: Engine):
