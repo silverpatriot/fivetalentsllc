@@ -85,10 +85,13 @@ async def test_verify_citation_resolves_ordinal_forms_of_numbered_books():
     No quote attached — this is testing reference RESOLUTION, not the
     separate quote-similarity check (a truncated quote would legitimately
     score as a mismatch against the full multi-clause verse, which isn't
-    what this test is about)."""
+    what this test is about). status is not_quoted, not verified, for the
+    same reason as test_verify_citation_reports_not_quoted_for_a_bare_
+    reference below — this draft genuinely has no quote marks in it at
+    all, so resolution succeeding is proven by source_text, not status."""
     draft = "As I Corinthians 13:4 reminds us, love is patient and kind."
     result = await bible.verify_citation("I Corinthians 13:4", draft)
-    assert result["status"] == "verified"
+    assert result["status"] == "not_quoted"
     assert result["source_text"] is not None
     assert "suffereth long" in result["source_text"]
 
@@ -121,10 +124,36 @@ async def test_verify_citation_passes_accurate_quote():
     assert result["status"] == "verified"
 
 
-async def test_verify_citation_passes_reference_with_no_attached_quote():
+async def test_verify_citation_reports_not_quoted_for_a_bare_reference():
     """A bare parenthetical reference with nothing quoted next to it isn't
-    itself suspicious — nothing to check the wording of."""
+    itself suspicious, but it's also not the same claim as `verified` —
+    nothing was checked, so it gets its own status (`not_quoted`) rather
+    than reusing `verified` for a check that never happened. Renamed from
+    this test's old status=="verified" assertion — a deliberate, confirmed
+    behavior change, not a regression (see test_verify_citation_does_not_
+    misattribute_a_distant_unrelated_quote below for why the distinction
+    matters in practice)."""
     draft = "God's love for the world is the whole point of the gospel (John 3:16)."
     result = await bible.verify_citation("John 3:16", draft)
-    assert result["status"] == "verified"
+    assert result["status"] == "not_quoted"
     assert result["quoted_text"] is None
+    assert result["source_text"] is not None  # the reference did resolve
+
+
+async def test_verify_citation_does_not_misattribute_a_distant_unrelated_quote():
+    """Regression: the exact bug found live in Phase 6 edit-testing. A
+    reference mentioned only in indirect/paraphrased prose, in its own
+    sentence, with an unrelated quotation elsewhere in the document close
+    enough (well within the OLD fixed 400-character window) to have been
+    wrongly matched to it. Must be reported as not_quoted, not matched
+    against — and definitely not flagged as a mismatch — against text
+    that has nothing to do with this reference."""
+    draft = (
+        'She said, "Do you see how much that hurt me?" That question sat with him for days.\n\n'
+        "I think of the warning in Hebrews 12:15, where believers are told to watch that no one "
+        "falls short of the grace of God."
+    )
+    result = await bible.verify_citation("Hebrews 12:15", draft)
+    assert result["status"] == "not_quoted"
+    assert result["quoted_text"] is None
+    assert "hurt me" not in (result["detail"] or "")

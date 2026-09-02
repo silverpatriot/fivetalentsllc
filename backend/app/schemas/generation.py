@@ -24,7 +24,7 @@ class CitationFlag(BaseModel):
     trust the model to quote accurately from memory")."""
 
     reference: str
-    status: str  # "verified" | "invalid_reference" | "quote_mismatch"
+    status: str  # "verified" | "not_quoted" | "invalid_reference" | "quote_mismatch"
     quoted_text: str | None = None
     source_text: str | None = None
     detail: str

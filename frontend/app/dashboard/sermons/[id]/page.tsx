@@ -22,11 +22,20 @@ type Sermon = {
 
 type CitationFlag = {
   reference: string;
-  status: "verified" | "invalid_reference" | "quote_mismatch";
+  // "not_quoted": the reference resolves but nothing in the draft
+  // directly quotes it (bare parenthetical, or indirect/paraphrased
+  // prose) — nothing was checked, so nothing failed. Distinct from
+  // "verified" (wording actually checked and matched); grouped with it
+  // for styling/counting purposes below (see OK_CITATION_STATUSES).
+  status: "verified" | "not_quoted" | "invalid_reference" | "quote_mismatch";
   quoted_text: string | null;
   source_text: string | null;
   detail: string;
 };
+
+// Mirrors app/services/generation.py's _OK_CITATION_STATUSES — statuses
+// that mean "nothing wrong here", not a real problem to flag.
+const OK_CITATION_STATUSES = new Set(["verified", "not_quoted"]);
 
 // Parses the backend's Server-Sent-Events stream (see
 // app/services/generation.py's _sse()) into discrete {event, data}
@@ -55,10 +64,9 @@ function parseSseChunk(buffer: string): { frames: { event: string; data: unknown
 }
 
 function CitationBadge({ flag }: { flag: CitationFlag }) {
-  const style =
-    flag.status === "verified"
-      ? "bg-secondary text-secondary-foreground"
-      : "bg-destructive/10 text-destructive";
+  const style = OK_CITATION_STATUSES.has(flag.status)
+    ? "bg-secondary text-secondary-foreground"
+    : "bg-destructive/10 text-destructive";
   return (
     <div className={`rounded-lg px-2.5 py-1.5 text-xs ${style}`}>
       <span className="font-medium">{flag.reference}</span> — {flag.detail}
@@ -302,7 +310,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
     );
   }
 
-  const flaggedCount = citations?.filter((c) => c.status !== "verified").length ?? 0;
+  const flaggedCount = citations?.filter((c) => !OK_CITATION_STATUSES.has(c.status)).length ?? 0;
   const manuscript = draftText || sermon.content;
 
   return (

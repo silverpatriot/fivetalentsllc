@@ -54,6 +54,17 @@ from app.tasks.usage_reporting import record_usage_event
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Citation statuses that mean "nothing wrong here" — used below to decide
+# what counts as a flagged citation worth warning about / reporting via
+# flagged_citation_count. `not_quoted` (bible.verify_citation) means
+# "nothing was quoted, so nothing was checked" — genuinely fine, same as
+# `verified`, and NOT the same thing as `invalid_reference`/
+# `quote_mismatch`, which are real problems. Keeping this as one shared
+# set (rather than repeating the != "verified" check per call site) is
+# what a prior version of this file got wrong: `not_quoted` didn't exist
+# yet when both filters below were written as `!= "verified"` alone.
+_OK_CITATION_STATUSES = {"verified", "not_quoted"}
+
 
 def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
@@ -202,7 +213,7 @@ async def _run(
     # --- Trust and accuracy: verify every citation before it's shown,
     # never trust the model's memory of scripture text. ---
     citation_flags = await bible.verify_all_citations(draft_text, request.translation)
-    flagged = [f for f in citation_flags if f["status"] != "verified"]
+    flagged = [f for f in citation_flags if f["status"] not in _OK_CITATION_STATUSES]
     if flagged:
         logger.warning(
             "Sermon %s draft has %d unverified/mismatched citation(s): %s",
@@ -451,7 +462,7 @@ async def _run_edit(
     # caught exactly like one would in a fresh draft; one anywhere else
     # in the untouched text is re-confirmed too, cheaply (no LLM cost). ---
     citation_flags = await bible.verify_all_citations(new_content, request.translation)
-    flagged = [f for f in citation_flags if f["status"] != "verified"]
+    flagged = [f for f in citation_flags if f["status"] not in _OK_CITATION_STATUSES]
     if flagged:
         logger.warning(
             "Sermon %s edit has %d unverified/mismatched citation(s): %s",

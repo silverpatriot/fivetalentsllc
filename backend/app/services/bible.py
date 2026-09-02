@@ -300,24 +300,56 @@ def _normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", s.lower()).strip()
 
 
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _sentence_span(text: str, idx: int) -> tuple[int, int]:
+    """The [start, end) span of the sentence containing character index
+    idx — not "nearby", the SAME sentence. A citation and its
+    quotation, when a draft actually attributes one to the other, are
+    always written in the same sentence (see _extract_quoted_near's two
+    documented patterns). Searching any wider than that is what let
+    _extract_quoted_near match an unrelated quote from a different
+    paragraph entirely — confirmed live (Phase 6 edit-testing): a
+    passage rewritten into indirect/reported prose with no quote of its
+    own got matched against a quotation two sentences and a paragraph
+    break away, inside the old fixed 400-character window.
+
+    Boundaries are plain '.'/'!'/'?' followed by whitespace — not full
+    sentence segmentation, but a book/chapter:verse reference never
+    contains that punctuation, so it can't fool this into treating the
+    reference itself as a boundary."""
+    start = 0
+    for m in _SENTENCE_BOUNDARY_RE.finditer(text, 0, idx):
+        start = m.end()
+    match = _SENTENCE_BOUNDARY_RE.search(text, idx)
+    return start, (match.start() if match else len(text))
+
+
 def _extract_quoted_near(text: str, reference: str) -> str | None:
-    """If a quoted string sits close to `reference` in `text`, return it.
-    Sermon drafts attribute quotes both ways — "'quoted text' (John
-    3:16)" and "John 3:16 says, 'quoted text'" are both common — so this
-    checks a window on both sides and returns whichever quote is closest
-    to the citation. Returns None if there's no quote nearby at all;
-    plenty of citations are bare parenthetical references with nothing
-    quoted next to them, and that's not itself suspicious."""
+    """If a quoted string sits in the SAME SENTENCE as `reference`,
+    return it. Sermon drafts attribute quotes both ways — "'quoted
+    text' (John 3:16)" and "John 3:16 says, 'quoted text'" are both
+    common — so this checks both sides of the reference within that one
+    sentence and returns whichever quote is closest to it. Returns None
+    if there's no quote in that sentence at all — either a bare
+    parenthetical reference, or (see verify_citation's `not_quoted`
+    status) a reference only mentioned in indirect/paraphrased prose.
+    Deliberately does NOT fall back to searching neighboring sentences
+    or the wider document — that's exactly the behavior that used to
+    misattribute an unrelated nearby quotation to a reference that was
+    never actually quoted at all."""
     idx = text.find(reference)
     if idx == -1:
         return None
     end = idx + len(reference)
+    sent_start, sent_end = _sentence_span(text, idx)
 
-    before = text[max(0, idx - 400) : idx]
+    before = text[sent_start:idx]
     before_matches = list(re.finditer(r"[\"“]([^\"”]{5,400})[\"”]", before))
     best_before = (len(before) - before_matches[-1].end(), before_matches[-1].group(1)) if before_matches else None
 
-    after = text[end : end + 400]
+    after = text[end:sent_end]
     after_matches = list(re.finditer(r"[\"“]([^\"”]{5,400})[\"”]", after))
     best_after = (after_matches[0].start(), after_matches[0].group(1)) if after_matches else None
 
@@ -331,10 +363,23 @@ async def verify_citation(reference: str, draft_text: str, translation: str | No
     """Check one citation from a model-generated draft against the real
     Bible text. Returns a dict matching app.schemas.generation.CitationFlag.
 
-    Two distinct failure modes, both surfaced to the UI per Task 3 rather
-    than silently passing the reference through:
+    Three distinct outcomes for a resolvable reference, not two — this
+    used to collapse "no quote nearby" into status="verified", which
+    conflated two different claims: "we checked the wording and it
+    matches" vs. "there was nothing to check." Confirmed live (Phase 6
+    edit-testing) that conflation had a real cost: _extract_quoted_near
+    used to fall back to searching a wide window for ANY nearby quote
+    rather than admitting there wasn't one, which could misattribute an
+    unrelated quotation elsewhere in the draft to a reference that was
+    never actually quoted. not_quoted reports that state honestly
+    instead of either flagging it as wrong or matching it against text
+    that has nothing to do with it:
       - invalid_reference: the reference itself doesn't resolve (hallucinated
         book/chapter/verse).
+      - not_quoted: the reference is real, but nothing in the draft directly
+        quotes it (a bare parenthetical, or a reference only mentioned in
+        indirect/paraphrased prose) — not itself suspicious, and distinct
+        from `verified`, which means the wording was actually checked.
       - quote_mismatch: the reference is real, but text quoted next to it
         in the draft doesn't closely match the source translation — either
         the model misquoted, or it's quoting a different translation than
@@ -356,10 +401,10 @@ async def verify_citation(reference: str, draft_text: str, translation: str | No
     if quoted is None:
         return {
             "reference": reference,
-            "status": "verified",
+            "status": "not_quoted",
             "quoted_text": None,
             "source_text": passage.text,
-            "detail": "Reference exists; no direct quotation was attributed to it in the draft.",
+            "detail": "Reference exists but isn't directly quoted in the draft — nothing to verify the wording of.",
         }
 
     similarity = difflib.SequenceMatcher(None, _normalize(quoted), _normalize(passage.text)).ratio()
