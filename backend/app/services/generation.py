@@ -21,6 +21,7 @@ transaction that set it had already been closed out from under it. This
 generator owning its session end-to-end is the fix, not a workaround
 layered on top of it.
 """
+import asyncio
 import json
 import logging
 import uuid
@@ -68,6 +69,35 @@ _OK_CITATION_STATUSES = {"verified", "not_quoted"}
 
 def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+# Phase 6 follow-up (2026-09-02): _run_edit's locate call, and each chunk
+# of its edit/rewrite stream, can go completely silent — no SSE bytes at
+# all — for far longer than "a few seconds". Confirmed live: a single
+# locate call took up to ~90s against OpenRouter's shared rate-limited
+# pool, well past what an idle intermediate connection (a proxy, a flaky
+# client) might tolerate with nothing on the wire. _HEARTBEAT_INTERVAL_
+# SECONDS is a plain module attribute (not a default parameter value) so
+# a test can monkeypatch it — a default parameter's value is bound once,
+# at function-definition time, and would ignore a later monkeypatch of
+# the module constant; every call site below re-reads this name at call
+# time instead.
+_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_SSE_HEARTBEAT = b": keepalive\n\n"
+
+
+async def _heartbeat_while_pending(task: "asyncio.Task", interval: float) -> AsyncIterator[bytes]:
+    """Yields a raw SSE comment line (`: keepalive\n\n` — valid SSE
+    syntax every real client silently ignores; EventSource never fires
+    an event for a comment line) every `interval` seconds for as long as
+    `task` is still running. Does NOT retrieve `task`'s result or
+    exception — the caller awaits `task` itself once this generator is
+    exhausted (awaiting an already-done task returns/raises immediately,
+    no extra delay)."""
+    while not task.done():
+        _, pending = await asyncio.wait({task}, timeout=interval)
+        if task in pending:
+            yield _SSE_HEARTBEAT
 
 
 async def _record_llm_call(
@@ -383,8 +413,13 @@ async def _run_edit(
         target_span = original_content[start:end]
     else:
         locate_messages = build_locate_messages(original_content, request.instruction)
+        locate_task = asyncio.ensure_future(
+            chat_completion(settings.openrouter_outline_model, locate_messages)
+        )
+        async for heartbeat in _heartbeat_while_pending(locate_task, _HEARTBEAT_INTERVAL_SECONDS):
+            yield heartbeat
         try:
-            locate_raw_text, locate_raw = await chat_completion(settings.openrouter_outline_model, locate_messages)
+            locate_raw_text, locate_raw = await locate_task
         except OpenRouterError as exc:
             logger.exception("Edit-locate failed for sermon %s", sermon.id)
             sermon.status = "ready"
@@ -437,10 +472,23 @@ async def _run_edit(
     edit_messages = build_edit_messages(original_content, target_span, request.instruction)
     replacement_chunks: list[str] = []
     raw_lines: list[str] = []
+    # Heartbeat-protected per-chunk, not just a plain `async for` — a
+    # slow start (nothing until the model's first token arrives) is the
+    # same silent-gap shape as the locate call above, and an unusually
+    # slow gap between tokens gets the same protection for free, at no
+    # cost when tokens are actually flowing normally.
+    stream_iter = stream_chat_completion(
+        settings.openrouter_draft_model, edit_messages, raw_sink=raw_lines
+    ).__aiter__()
     try:
-        async for delta in stream_chat_completion(
-            settings.openrouter_draft_model, edit_messages, raw_sink=raw_lines
-        ):
+        while True:
+            next_task = asyncio.ensure_future(stream_iter.__anext__())
+            async for heartbeat in _heartbeat_while_pending(next_task, _HEARTBEAT_INTERVAL_SECONDS):
+                yield heartbeat
+            try:
+                delta = await next_task
+            except StopAsyncIteration:
+                break
             replacement_chunks.append(delta)
             yield _sse("delta", {"text": delta})
     except OpenRouterError as exc:

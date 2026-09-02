@@ -16,7 +16,11 @@ OpenRouter calls themselves are mocked. Proves, specifically:
 - the per-sermon edit cap hard-blocks before any LLM call is spent.
 - sermon_revisions preserves the pre-edit content (Task 2's minimum
   viable recoverability).
+- SSE heartbeats keep the stream alive during a slow locate/edit call
+  (2026-09-02 follow-up — see app/services/generation.py's
+  _heartbeat_while_pending).
 """
+import asyncio
 import uuid
 from typing import Iterator
 
@@ -179,6 +183,45 @@ def test_edit_without_selection_uses_locate_then_splices(
     expected = f"{PARAGRAPH_1}\n\n{PARAGRAPH_2}\n\n{replacement}"
     assert sermon_row.content == expected
     assert {row.stage for row in log_rows} == {"edit_locate", "edit"}
+
+
+def test_edit_sends_sse_heartbeats_during_a_slow_locate_call(active_tenant_with_org: dict, auth_headers: dict, monkeypatch):
+    """Structural fix, 2026-09-02: the locate call (and each chunk of the
+    edit/rewrite stream) can legitimately go silent for far longer than a
+    few seconds — confirmed live against OpenRouter's shared rate-limited
+    pool, up to ~90s for a single locate call, with zero SSE bytes
+    otherwise sent in that whole window. This proves the heartbeat
+    mechanism actually puts bytes on the wire during that gap: a
+    deliberately slow mocked locate call, with the heartbeat interval
+    monkeypatched way down so the test itself stays fast rather than
+    literally waiting 15s+."""
+    sermon_id = _create_sermon_with_content(auth_headers)
+    monkeypatch.setattr("app.services.generation._HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+    async def _slow_locate(model, messages):
+        await asyncio.sleep(0.35)  # several heartbeat intervals at 0.05s each
+        return f"<<<TARGET>>>\n{PARAGRAPH_1}\n<<<END_TARGET>>>", "{}"
+
+    async def _fake_stream(model, messages, raw_sink=None):
+        yield "Point one, revised."
+
+    monkeypatch.setattr("app.services.generation.chat_completion", _slow_locate)
+    monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    resp = client.post(
+        f"/sermons/{sermon_id}/edit",
+        json={"instruction": "tighten point 1"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    heartbeat_count = resp.text.count(": keepalive")
+    assert heartbeat_count >= 2, (
+        f"expected multiple heartbeats during a 0.35s wait at a 0.05s interval, got {heartbeat_count}"
+    )
+    # Heartbeats arrive DURING the wait, before the target event that
+    # only comes once the (slow) locate call actually resolves.
+    assert resp.text.index(": keepalive") < resp.text.index("event: target")
 
 
 def test_edit_locate_span_not_found_is_a_clean_error_not_a_silent_edit(
