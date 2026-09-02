@@ -17,6 +17,16 @@ class GenerationStage(str, enum.Enum):
     # distinct from OUTLINE (the internal pre-draft pass every generation
     # already ran, never persisted on its own).
     OUTLINE_CONDENSE = "outline_condense"
+    # Migration 0015 (Phase 6) — iterative draft editing, both real LLM
+    # calls app/services/generation.py's _run_edit can make: EDIT_LOCATE
+    # only runs when the pastor didn't select text themselves (identifies
+    # which span an instruction targets); EDIT is the scoped rewrite call
+    # itself. _record_llm_call's existing billable logic already treats
+    # any non-DRAFT stage as billable=False, so both inherit that without
+    # change — same "free follow-up on an already-billed sermon" as
+    # OUTLINE_CONDENSE.
+    EDIT_LOCATE = "edit_locate"
+    EDIT = "edit"
 
 
 class GenerationLog(Base, UUIDPkMixin, CreatedAtMixin):

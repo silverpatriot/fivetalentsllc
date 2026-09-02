@@ -58,6 +58,22 @@ from app.models.generation_log import GenerationStage
 from app.models.tenant import Tenant
 from app.models.usage_event import UsageEvent, UsageEventType
 
+# Phase 6: a lightweight cost/abuse guardrail on per-sermon edit
+# requests — NOT a billing feature (see EDIT/EDIT_LOCATE's billable=False
+# in _record_llm_call). Unlike the sermon quota above, which is soft
+# (still runs, just becomes billable overage), this hard-blocks a request
+# once hit, before any LLM call is made — same spirit as rate-limiting,
+# not quota enforcement. Counts BOTH stages (a failed locate that never
+# reached the actual edit call still cost a real LLM call, so it still
+# counts), regardless of outcome, for the life of the sermon — not a
+# rolling window. 30 gives real headroom for a pastor iterating point-by-
+# point over a whole sermon while bounding worst-case per-sermon spend;
+# raising it is a one-line change, unlike walking back unbounded usage
+# once it exists.
+MAX_EDITS_PER_SERMON = 30
+
+_EDIT_STAGES = (GenerationStage.EDIT, GenerationStage.EDIT_LOCATE)
+
 # None = unlimited — Enterprise is a custom, contact-sales price that
 # covers everything, no metered overage ever.
 PLAN_TIER_MONTHLY_SERMONS: dict[str, int | None] = {
@@ -115,6 +131,27 @@ def is_within_sermon_quota(tenant_id: uuid.UUID) -> bool:
             )
         ).scalar_one()
         return used < quota
+
+
+def is_within_edit_cap(tenant_id: uuid.UUID, sermon_id: uuid.UUID) -> bool:
+    """True if this sermon has made fewer than MAX_EDITS_PER_SERMON real
+    edit-related LLM calls so far. Sync, same calling convention as
+    is_within_sermon_quota — call via run_in_threadpool. Checked BEFORE
+    the edit endpoint makes any LLM call (app/api/sermons.py), so hitting
+    the cap costs nothing further; already-spent calls before the cap
+    was hit are, correctly, not retroactively undone."""
+    with tenant_session_sync(tenant_id) as session:
+        used = session.execute(
+            select(func.count())
+            .select_from(UsageEvent)
+            .where(
+                UsageEvent.tenant_id == tenant_id,
+                UsageEvent.sermon_id == sermon_id,
+                UsageEvent.event_type == UsageEventType.AI_GENERATION,
+                UsageEvent.generation_stage.in_(_EDIT_STAGES),
+            )
+        ).scalar_one()
+        return used < MAX_EDITS_PER_SERMON
 
 
 def has_cadence_access(tenant_id: uuid.UUID) -> bool:

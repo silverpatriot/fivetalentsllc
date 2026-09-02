@@ -7,6 +7,7 @@ from app.models.generation_log import GenerationLog, GenerationStage
 from app.models.media_file import MediaFile
 from app.models.reference import ReferenceChunk, ReferenceDocument, ReferenceType
 from app.models.sermon import Sermon, SermonFormat
+from app.models.sermon_revision import SermonRevision
 from app.models.tenant import Tenant
 from app.models.usage_event import UsageEvent, UsageEventType
 from app.models.user import User, UserRole
@@ -19,6 +20,7 @@ __all__ = [
     "UserRole",
     "Sermon",
     "SermonFormat",
+    "SermonRevision",
     "Document",
     "DocumentChunk",
     "CorpusType",

@@ -19,13 +19,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.core.deps import get_active_tenant_id, get_db
 from app.models.sermon import Sermon
-from app.schemas.generation import GenerateRequest
+from app.schemas.generation import EditRequest, GenerateRequest
 from app.schemas.sermon import OutlineGenerateRequest, SermonCreate, SermonRead, SermonUpdate
-from app.services.generation import generate_outline_from_manuscript, generate_sermon_stream
+from app.services.generation import edit_sermon_stream, generate_outline_from_manuscript, generate_sermon_stream
 from app.services.openrouter import OpenRouterError
+from app.services.plan_limits import MAX_EDITS_PER_SERMON, is_within_edit_cap
 
 router = APIRouter(prefix="/sermons", tags=["sermons"])
 
@@ -118,6 +120,55 @@ async def generate_sermon(
     await _get_owned_sermon(db, sermon_id)
     return StreamingResponse(
         generate_sermon_stream(tenant_id, sermon_id, body),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/{sermon_id}/edit")
+async def edit_sermon(
+    sermon_id: uuid.UUID,
+    body: EditRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    tenant_id: Annotated[uuid.UUID, Depends(get_active_tenant_id)],
+) -> StreamingResponse:
+    """Phase 6: iterative, section-scoped editing of an existing draft,
+    streamed back as SSE the same way /generate is — see
+    app/services/generation.py's _run_edit for the event sequence
+    (`target`, `delta`, `citations`, `done`/`error`).
+
+    Every pre-flight check that doesn't need an LLM call happens HERE,
+    against the request-scoped `db`, so a bad request fails fast with a
+    real HTTP status rather than a mid-stream SSE error — same reasoning
+    generate_sermon already follows for the sermon-existence check:
+    - sermon exists and has a manuscript to edit
+    - the edit cap (a cost/abuse guardrail, not billing — see
+      plan_limits.is_within_edit_cap) isn't already exhausted, checked
+      BEFORE any LLM call is made, not after
+    - a given selection's offsets are actually valid against the CURRENT
+      content (the generator re-validates this too, since its own
+      session re-fetches content — this is the fast-fail copy of that
+      same check)
+    """
+    sermon = await _get_owned_sermon(db, sermon_id)
+    if sermon.content is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Generate a manuscript before editing it"
+        )
+    if body.selection is not None:
+        sel = body.selection
+        if sel.start < 0 or sel.end > len(sermon.content) or sel.start >= sel.end:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selection does not match the current draft",
+            )
+    if not await run_in_threadpool(is_within_edit_cap, tenant_id, sermon_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"This sermon has reached its edit limit ({MAX_EDITS_PER_SERMON}) for now.",
+        )
+    return StreamingResponse(
+        edit_sermon_stream(tenant_id, sermon_id, body),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

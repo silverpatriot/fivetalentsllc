@@ -99,6 +99,31 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
   const [creatingOutline, setCreatingOutline] = useState(false);
   const [outlineError, setOutlineError] = useState<string | null>(null);
 
+  // Phase 6: iterative, chat-style editing of the already-generated
+  // draft above. manuscriptRef + editSelection capture a real text
+  // selection the pastor makes IN the rendered draft — see
+  // handleManuscriptMouseUp — which becomes the exact {start, end}
+  // character offsets POST /sermons/{id}/edit uses to scope the edit
+  // (Task 1.1's confirmed design). Without a selection, the backend
+  // locates the target itself instead.
+  const manuscriptRef = useRef<HTMLDivElement>(null);
+  const [editSelection, setEditSelection] = useState<{ start: number; end: number; text: string } | null>(null);
+  const [editInstruction, setEditInstruction] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  // The span the backend actually locked onto (echoed back via the
+  // `target` SSE event) — same thing as editSelection when the pastor
+  // selected text themselves, but this is the only way to see it when
+  // they didn't (the backend's own locate step chose it instead).
+  const [editTarget, setEditTarget] = useState<{ start: number; end: number; text: string } | null>(null);
+  // The streamed REPLACEMENT text only (never the whole manuscript — see
+  // _run_edit's docstring) — shown in its own preview panel rather than
+  // spliced into the manuscript live, so the draft never renders in a
+  // half-edited state mid-stream. sermon.content only updates once, from
+  // the `done` event's authoritative already-spliced full text.
+  const [editPreview, setEditPreview] = useState("");
+  const editPreviewRef = useRef("");
+
   useEffect(() => {
     fetch(`/api/sermons/${id}`)
       .then(async (r) => {
@@ -184,6 +209,90 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
     }
   }
 
+  // A real text selection inside the rendered manuscript -> the exact
+  // character offsets into sermon.content it corresponds to. Standard
+  // Range-measurement technique: a second Range spanning the container's
+  // start to the selection's start, whose stringified length IS the
+  // start offset, because manuscriptRef's only rendered child (once
+  // !generating) is `{manuscript}` itself with nothing else mixed in —
+  // no icons or extra text nodes to throw the count off.
+  function handleManuscriptMouseUp() {
+    if (!manuscriptRef.current) return;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    const range = sel.getRangeAt(0);
+    if (!manuscriptRef.current.contains(range.commonAncestorContainer)) return;
+    const text = range.toString();
+    if (!text) return;
+    const preRange = document.createRange();
+    preRange.selectNodeContents(manuscriptRef.current);
+    preRange.setEnd(range.startContainer, range.startOffset);
+    const start = preRange.toString().length;
+    setEditSelection({ start, end: start + text.length, text });
+  }
+
+  async function handleEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editInstruction.trim()) return;
+    setEditing(true);
+    setEditError(null);
+    setEditTarget(null);
+    setEditPreview("");
+    editPreviewRef.current = "";
+
+    try {
+      const resp = await fetch(`/api/sermons/${id}/edit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instruction: editInstruction,
+          selection: editSelection ? { start: editSelection.start, end: editSelection.end } : undefined,
+        }),
+      });
+      if (!resp.ok || resp.body === null) {
+        const data = await resp.json().catch(() => ({}));
+        throw new Error(data.detail ?? `Edit failed (${resp.status})`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const { frames, rest } = parseSseChunk(buffer);
+        buffer = rest;
+        for (const frame of frames) {
+          if (frame.event === "target") {
+            setEditTarget(frame.data as { start: number; end: number; text: string });
+          } else if (frame.event === "delta") {
+            editPreviewRef.current += (frame.data as { text: string }).text;
+            setEditPreview(editPreviewRef.current);
+          } else if (frame.event === "citations") {
+            // Same treatment as original generation's citations block
+            // below — an edit re-verifies the WHOLE draft, so this is
+            // the up-to-date, complete citation list either way.
+            setCitations((frame.data as { flags: CitationFlag[] }).flags);
+          } else if (frame.event === "error") {
+            setEditError((frame.data as { detail: string }).detail);
+          } else if (frame.event === "done") {
+            const data = frame.data as { content: string };
+            setSermon((s) => (s ? { ...s, content: data.content } : s));
+            setEditInstruction("");
+            setEditSelection(null);
+            setEditTarget(null);
+            setEditPreview("");
+          }
+        }
+      }
+    } catch (e) {
+      setEditError(e instanceof Error ? e.message : "Edit failed");
+    } finally {
+      setEditing(false);
+    }
+  }
+
   if (loadError) return <p className="text-destructive text-sm">{loadError}</p>;
   if (!sermon) {
     return (
@@ -251,10 +360,77 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
               </Button>
             )}
           </div>
-          <div className="mt-1 whitespace-pre-wrap text-sm leading-relaxed">
+          <div
+            ref={manuscriptRef}
+            onMouseUp={generating ? undefined : handleManuscriptMouseUp}
+            className="mt-1 whitespace-pre-wrap text-sm leading-relaxed"
+          >
             {manuscript}
             {generating && <span className="animate-pulse">▍</span>}
           </div>
+        </div>
+      )}
+
+      {/* Phase 6: iterative editing of the draft above — chat-style, on
+          the same page (not a separate view), since the pastor needs to
+          see the draft while asking for changes to it. */}
+      {sermon.content && !generating && (
+        <div className="border-border flex flex-col gap-3 rounded-lg border p-4">
+          <div>
+            <h2 className="text-sm font-semibold">Edit this draft</h2>
+            <p className="text-muted-foreground text-xs">
+              Select text above to target a specific part, or just describe the change — e.g. &ldquo;make
+              point 2 more personal&rdquo;, &ldquo;shorten the introduction&rdquo;.
+            </p>
+          </div>
+
+          {editSelection && (
+            <div className="bg-secondary/50 flex items-start justify-between gap-2 rounded-lg p-2 text-xs">
+              <span className="text-muted-foreground italic">
+                Selected: &ldquo;
+                {editSelection.text.length > 140 ? editSelection.text.slice(0, 140) + "…" : editSelection.text}
+                &rdquo;
+              </span>
+              <button
+                type="button"
+                className="text-muted-foreground shrink-0 underline"
+                onClick={() => setEditSelection(null)}
+              >
+                Clear
+              </button>
+            </div>
+          )}
+
+          <form onSubmit={handleEdit} className="flex gap-2">
+            <Input
+              value={editInstruction}
+              onChange={(e) => setEditInstruction(e.target.value)}
+              placeholder="Make point 2 more personal…"
+              disabled={editing}
+            />
+            <Button type="submit" disabled={editing || !editInstruction.trim()}>
+              {editing ? "Revising…" : "Apply edit"}
+            </Button>
+          </form>
+
+          {editError && (
+            <div className="bg-destructive/10 text-destructive rounded-lg p-3 text-sm">{editError}</div>
+          )}
+
+          {editTarget && (
+            <p className="text-muted-foreground text-xs">
+              Revising: <span className="italic">
+                &ldquo;{editTarget.text.length > 140 ? editTarget.text.slice(0, 140) + "…" : editTarget.text}&rdquo;
+              </span>
+            </p>
+          )}
+
+          {editPreview && (
+            <div className="rounded-lg border p-3 text-sm whitespace-pre-wrap leading-relaxed">
+              {editPreview}
+              {editing && <span className="animate-pulse">▍</span>}
+            </div>
+          )}
         </div>
       )}
 

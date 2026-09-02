@@ -35,8 +35,9 @@ from app.db.session import tenant_session
 from app.models.document import CorpusType, DocumentSource
 from app.models.generation_log import GenerationLog, GenerationStage
 from app.models.sermon import Sermon
+from app.models.sermon_revision import SermonRevision
 from app.models.usage_event import UsageEventType
-from app.schemas.generation import GenerateRequest
+from app.schemas.generation import EditRequest, GenerateRequest
 from app.services import bible
 from app.services.context_assembly import (
     assemble_context,
@@ -44,6 +45,7 @@ from app.services.context_assembly import (
     build_draft_messages,
     build_outline_messages,
 )
+from app.services.editing_prompts import build_edit_messages, build_locate_messages, extract_target_span
 from app.services.ingestion import ingest_text
 from app.services.openrouter import OpenRouterError, chat_completion, stream_chat_completion
 from app.services.plan_limits import has_cadence_access, is_within_sermon_quota
@@ -307,3 +309,192 @@ async def generate_outline_from_manuscript(
     )
     sermon.outline = full_outline
     await db.flush()
+
+
+async def edit_sermon_stream(
+    tenant_id: uuid.UUID, sermon_id: uuid.UUID, request: EditRequest
+) -> AsyncIterator[bytes]:
+    """Phase 6: iterative, section-scoped editing of an already-generated
+    draft. Same own-session-for-the-whole-generator reasoning as
+    generate_sermon_stream (see its docstring) — StreamingResponse tears
+    down a Depends(get_db) session before this body has run a line.
+    """
+    async with tenant_session(tenant_id) as db:
+        async for event in _run_edit(db, tenant_id, sermon_id, request):
+            yield event
+
+
+async def _run_edit(
+    db, tenant_id: uuid.UUID, sermon_id: uuid.UUID, request: EditRequest
+) -> AsyncIterator[bytes]:
+    """The safety property this whole flow is built around: the model
+    NEVER sees or returns the full manuscript for a rewrite. It only ever
+    gets back ONE exact target span (from the pastor's own text
+    selection, or — when nothing's selected — a separate locate call that
+    must reproduce that span verbatim from the real content). This
+    function then splices the model's replacement into that exact span
+    itself. Everything outside it is untouched by construction, not by
+    prompting discipline — see the Phase 6 kickoff spec's Task 1.1
+    checkpoint for why that distinction was the deciding factor over a
+    simpler full-draft-rewrite-per-edit design.
+
+    A span that can't be found, or isn't unique, in the current content
+    is a clean, reported failure (SSE `error`) rather than a silent edit
+    against the wrong text — "provably untouched" over "probably
+    untouched" was the explicit bar set for this design.
+    """
+    result = await db.execute(select(Sermon).where(Sermon.id == sermon_id))
+    sermon = result.scalar_one_or_none()
+    if sermon is None:
+        yield _sse("error", {"detail": "Sermon not found"})
+        return
+    if sermon.content is None:
+        yield _sse("error", {"detail": "Generate a manuscript before editing it"})
+        return
+
+    original_content = sermon.content
+    sermon.status = "generating"
+    await db.flush()
+
+    # --- Step 1: establish the target span. Selection-based (exact,
+    # unambiguous by construction — the frontend's own offsets) skips the
+    # locate call entirely; instruction-only falls back to it. ---
+    if request.selection is not None:
+        start, end = request.selection.start, request.selection.end
+        if start < 0 or end > len(original_content) or start >= end:
+            sermon.status = "ready"
+            await db.flush()
+            yield _sse(
+                "error",
+                {"detail": "That selection no longer matches the current draft — reload and try again."},
+            )
+            return
+        target_span = original_content[start:end]
+    else:
+        locate_messages = build_locate_messages(original_content, request.instruction)
+        try:
+            locate_raw_text, locate_raw = await chat_completion(settings.openrouter_outline_model, locate_messages)
+        except OpenRouterError as exc:
+            logger.exception("Edit-locate failed for sermon %s", sermon.id)
+            sermon.status = "ready"
+            await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT_LOCATE, "failed")
+            await db.flush()
+            yield _sse("error", {"detail": exc.user_message})
+            return
+
+        # The API call itself succeeded — outcome tracks call success,
+        # same convention as DRAFT (a flagged citation doesn't make a
+        # DRAFT call "failed" either). A span that doesn't parse or
+        # doesn't match the real content is a separate, application-level
+        # failure, reported below, not retried and not recorded as an
+        # OpenRouter failure it wasn't.
+        await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT_LOCATE, "succeeded")
+        db.add(
+            GenerationLog(
+                tenant_id=tenant_id,
+                sermon_id=sermon.id,
+                stage=GenerationStage.EDIT_LOCATE,
+                model=settings.openrouter_outline_model,
+                prompt={"messages": locate_messages},
+                raw_response=locate_raw,
+            )
+        )
+        await db.flush()
+
+        target_span = extract_target_span(locate_raw_text)
+        occurrences = original_content.count(target_span) if target_span else 0
+        if not target_span or occurrences != 1:
+            sermon.status = "ready"
+            await db.flush()
+            detail = (
+                "Couldn't pinpoint that part of the draft automatically — try selecting the exact "
+                "text you want changed and asking again."
+                if occurrences == 0
+                else "That instruction matched multiple places in the draft — try selecting the "
+                "exact text you want changed, or be more specific."
+            )
+            yield _sse("error", {"detail": detail})
+            return
+
+        start = original_content.find(target_span)
+        end = start + len(target_span)
+
+    yield _sse("target", {"start": start, "end": end, "text": target_span})
+
+    # --- Step 2: the scoped rewrite itself, streamed like the original
+    # draft pass — replacement text ONLY, never the whole manuscript. ---
+    edit_messages = build_edit_messages(original_content, target_span, request.instruction)
+    replacement_chunks: list[str] = []
+    raw_lines: list[str] = []
+    try:
+        async for delta in stream_chat_completion(
+            settings.openrouter_draft_model, edit_messages, raw_sink=raw_lines
+        ):
+            replacement_chunks.append(delta)
+            yield _sse("delta", {"text": delta})
+    except OpenRouterError as exc:
+        logger.exception("Edit failed for sermon %s", sermon.id)
+        sermon.status = "ready"
+        await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT, "failed")
+        await db.flush()
+        yield _sse("error", {"detail": exc.user_message})
+        return
+
+    await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT, "succeeded")
+
+    replacement_text = "".join(replacement_chunks)
+    new_content = original_content[:start] + replacement_text + original_content[end:]
+
+    # --- Step 3: verify EVERY citation in the resulting draft, full text
+    # — same call, same place in the flow, as original generation. An
+    # edit that introduces a new (possibly hallucinated) reference gets
+    # caught exactly like one would in a fresh draft; one anywhere else
+    # in the untouched text is re-confirmed too, cheaply (no LLM cost). ---
+    citation_flags = await bible.verify_all_citations(new_content, request.translation)
+    flagged = [f for f in citation_flags if f["status"] != "verified"]
+    if flagged:
+        logger.warning(
+            "Sermon %s edit has %d unverified/mismatched citation(s): %s",
+            sermon.id,
+            len(flagged),
+            [f["reference"] for f in flagged],
+        )
+
+    db.add(
+        GenerationLog(
+            tenant_id=tenant_id,
+            sermon_id=sermon.id,
+            stage=GenerationStage.EDIT,
+            model=settings.openrouter_draft_model,
+            prompt={"messages": edit_messages},
+            raw_response="\n".join(raw_lines),
+            citation_flags=citation_flags,
+        )
+    )
+
+    # Snapshot BEFORE overwriting — migration 0015's minimum-viable
+    # recoverability (Task 2): the pre-edit content is never lost, even
+    # though only sermon.content itself is ever the "live" version.
+    db.add(
+        SermonRevision(
+            tenant_id=tenant_id,
+            sermon_id=sermon.id,
+            content=original_content,
+            instruction=request.instruction,
+        )
+    )
+
+    sermon.content = new_content
+    sermon.status = "ready"
+    await db.flush()
+
+    yield _sse("citations", {"flags": citation_flags})
+    yield _sse(
+        "done",
+        {
+            "sermon_id": str(sermon.id),
+            "status": sermon.status,
+            "content": new_content,
+            "flagged_citation_count": len(flagged),
+        },
+    )
