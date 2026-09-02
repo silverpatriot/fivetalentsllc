@@ -300,82 +300,74 @@ def _normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", s.lower()).strip()
 
 
-_SENTENCE_END_RE = re.compile(r"[.!?][\"'’”)\]]*\s+")
 _PARAGRAPH_BREAK_RE = re.compile(r"\n\s*\n")
 
 
-def _sentence_span(text: str, idx: int) -> tuple[int, int]:
-    """The [start, end) span of the sentence containing character index
-    idx — not "nearby", the SAME sentence. A citation and its
-    quotation, when a draft actually attributes one to the other, are
-    always written in the same sentence (see _extract_quoted_near's two
-    documented patterns). Searching any wider than that is what let
-    _extract_quoted_near match an unrelated quote from a different
-    paragraph entirely — confirmed live (Phase 6 edit-testing): a
-    passage rewritten into indirect/reported prose with no quote of its
-    own got matched against a quotation two sentences and a paragraph
-    break away, inside the old fixed 400-character window.
+def _paragraph_span(text: str, idx: int) -> tuple[int, int]:
+    """The [start, end) span of the paragraph containing character index
+    idx — bounded ONLY by blank lines (two or more newlines), nothing
+    else. Three real, live failures on 2026-09-02 (Phase 6 edit-testing
+    on a real sermon) all traced back to this window being too wide, and
+    every one of them was specifically about crossing a PARAGRAPH break,
+    never about two unrelated quotes sitting in the same paragraph:
 
-    Two boundary types, whichever is closer wins on each side:
+      1. The original bug (a fixed 400-character window, no structural
+         boundary at all): an indirect-prose passage with no quote of
+         its own got matched against an unrelated quote in a different
+         paragraph.
+      2. A same-sentence boundary (replacing #1) still wasn't enough: a
+         sentence ending mid-quote ('...out."') wasn't recognized as a
+         boundary by a bare "punctuation then whitespace" regex, so the
+         window still leaked across a paragraph break.
+      3. Even a quote-aware sentence boundary (fixing #2) broke on a
+         REAL, correctly-quoted multi-sentence KJV verse: an internal
+         period inside the quotation itself ("...saith the Lord. But
+         if...") was wrongly read as the sentence's end, truncating the
+         search window in the middle of an open quote before its own
+         closing quote mark — the exact citation a pastor had just
+         gotten right came back not_quoted anyway.
 
-    - _SENTENCE_END_RE: '.'/'!'/'?', optionally followed by closing
-      quote/paren characters, then whitespace. The quote-mark allowance
-      matters — confirmed live (2026-09-02): a sentence ending
-      mid-quote ('...out.”') was NOT recognized as a boundary by an
-      earlier version of this regex (bare "punctuation, then whitespace"
-      — no allowance for a quote mark in between), which let the
-      search window silently leak across a full paragraph
-      break into a completely unrelated quote from the PREVIOUS
-      paragraph — the exact same class of bug this function exists to
-      prevent, just not fully closed by the first pass at it. A
-      book/chapter:verse reference never contains this punctuation, so
-      it can't fool this into treating the reference itself as a
-      boundary.
-    - _PARAGRAPH_BREAK_RE: a blank line (two or more newlines, any
-      whitespace between). An unconditional hard stop regardless of
-      punctuation — belt-and-suspenders for a sentence that's missing
-      its terminal punctuation entirely (a heading, a truncated line):
-      a real paragraph break should never be crossed either way."""
+    Sentence segmentation (periods inside quotes, abbreviations, verse
+    ranges) is genuinely open-ended; nothing about this feature has ever
+    actually needed sentence-level precision — paragraph-level was
+    always sufficient to prevent the real failure mode (a DIFFERENT
+    paragraph's quote getting misattributed), so this deliberately stops
+    trying to detect sentences at all."""
     start = 0
-    for m in _SENTENCE_END_RE.finditer(text, 0, idx):
-        start = max(start, m.end())
     for m in _PARAGRAPH_BREAK_RE.finditer(text, 0, idx):
-        start = max(start, m.end())
-
+        start = m.end()
     end = len(text)
-    m = _SENTENCE_END_RE.search(text, idx)
-    if m:
-        end = min(end, m.start())
     m = _PARAGRAPH_BREAK_RE.search(text, idx)
     if m:
-        end = min(end, m.start())
+        end = m.start()
     return start, end
 
 
 def _extract_quoted_near(text: str, reference: str) -> str | None:
-    """If a quoted string sits in the SAME SENTENCE as `reference`,
+    """If a quoted string sits in the SAME PARAGRAPH as `reference`,
     return it. Sermon drafts attribute quotes both ways — "'quoted
     text' (John 3:16)" and "John 3:16 says, 'quoted text'" are both
-    common — so this checks both sides of the reference within that one
-    sentence and returns whichever quote is closest to it. Returns None
-    if there's no quote in that sentence at all — either a bare
+    common — so this checks both sides of the reference within that
+    paragraph and returns whichever quote is closest to it. Returns None
+    if there's no quote in that paragraph at all — either a bare
     parenthetical reference, or (see verify_citation's `not_quoted`
     status) a reference only mentioned in indirect/paraphrased prose.
-    Deliberately does NOT fall back to searching neighboring sentences
+    Deliberately does NOT fall back to searching neighboring paragraphs
     or the wider document — that's exactly the behavior that used to
     misattribute an unrelated nearby quotation to a reference that was
-    never actually quoted at all."""
+    never actually quoted at all. See _paragraph_span's docstring for
+    why "paragraph", not "sentence", is the right unit here."""
     idx = text.find(reference)
     if idx == -1:
         return None
     end = idx + len(reference)
-    sent_start, sent_end = _sentence_span(text, idx)
+    para_start, para_end = _paragraph_span(text, idx)
 
-    before = text[sent_start:idx]
+    before = text[para_start:idx]
     before_matches = list(re.finditer(r"[\"“]([^\"”]{5,400})[\"”]", before))
     best_before = (len(before) - before_matches[-1].end(), before_matches[-1].group(1)) if before_matches else None
 
-    after = text[end:sent_end]
+    after = text[end:para_end]
     after_matches = list(re.finditer(r"[\"“]([^\"”]{5,400})[\"”]", after))
     best_after = (after_matches[0].start(), after_matches[0].group(1)) if after_matches else None
 
