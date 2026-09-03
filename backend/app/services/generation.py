@@ -92,6 +92,14 @@ _EDIT_LENGTH_RATIO_MAX = 2.5
 # tradeoff stays.
 _RESTRUCTURE_KEYWORDS = ("paragraph", "split", "section break", "line break", "restructure")
 
+# Phase 8 Task 1: tags a SermonRevision row created by a REGENERATION
+# (see _run below) rather than a real edit — instruction is NOT NULL, so
+# this is a fixed sentinel value rather than an empty/nullable field.
+# Public (no leading underscore): the Phase 8 Task 2 version-history UI
+# imports this directly to distinguish "regenerated" rows from real edit
+# instructions, rather than duplicating the literal string in two places.
+REGENERATION_INSTRUCTION_SENTINEL = "(sermon regenerated)"
+
 
 def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
@@ -336,6 +344,26 @@ async def _run(
         )
     )
     await db.flush()
+
+    # Phase 8 Task 1 fix: /generate has no guard against being called on
+    # a sermon that already has content (unlike /edit and /outline, which
+    # both check sermon.content is None first) — a regeneration used to
+    # silently overwrite whatever was there, including already-edited/
+    # refined content, with zero recovery trail. Mirrors _run_edit's own
+    # snapshot-before-overwrite pattern exactly, skipped only when there
+    # is genuinely nothing yet to snapshot (the real first-ever
+    # generation for this sermon). REGENERATION_INSTRUCTION_SENTINEL
+    # (not a real edit instruction) lets the version-history UI tell
+    # these rows apart from real edit instructions.
+    if sermon.content is not None:
+        db.add(
+            SermonRevision(
+                tenant_id=tenant_id,
+                sermon_id=sermon.id,
+                content=sermon.content,
+                instruction=REGENERATION_INSTRUCTION_SENTINEL,
+            )
+        )
 
     sermon.content = draft_text
     sermon.status = "ready"

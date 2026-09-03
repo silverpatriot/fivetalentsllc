@@ -16,7 +16,7 @@ import re
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,11 +25,22 @@ from starlette.concurrency import run_in_threadpool
 from app.core.deps import get_active_tenant_id, get_db
 from app.models.sermon import Sermon
 from app.schemas.generation import CitationFlag, EditRequest, GenerateRequest
-from app.schemas.sermon import OutlineGenerateRequest, SermonCreate, SermonRead, SermonUpdate
-from app.services import bible
+from app.schemas.sermon import (
+    DiffSegment,
+    OutlineGenerateRequest,
+    RestoreResponse,
+    RevisionCompareResponse,
+    RevisionDetail,
+    RevisionSummary,
+    SermonCreate,
+    SermonRead,
+    SermonUpdate,
+)
+from app.services import bible, revisions
 from app.services.generation import edit_sermon_stream, generate_outline_from_manuscript, generate_sermon_stream
 from app.services.openrouter import OpenRouterError
 from app.services.pdf_export import render_sermon_pdf
+from app.services.revision_diff import diff_words
 from app.services.plan_limits import MAX_EDITS_PER_SERMON, is_within_edit_cap
 
 router = APIRouter(prefix="/sermons", tags=["sermons"])
@@ -263,3 +274,84 @@ async def get_sermon_pdf(sermon_id: uuid.UUID, db: Annotated[AsyncSession, Depen
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{_pdf_filename(sermon.title)}"'},
     )
+
+
+@router.get("/{sermon_id}/revisions", response_model=list[RevisionSummary])
+async def list_sermon_revisions(sermon_id: uuid.UUID, db: Annotated[AsyncSession, Depends(get_db)]) -> list[RevisionSummary]:
+    """Phase 8 Task 2. Newest first; "current" (synthesized from
+    sermon.content, not a sermon_revisions row) leads the list whenever
+    the sermon has content — see app/services/revisions.py."""
+    sermon = await _get_owned_sermon(db, sermon_id)
+    return await revisions.list_revisions(db, sermon)
+
+
+# Declared BEFORE /{sermon_id}/revisions/{revision_id} deliberately —
+# both are 2-segment paths under /revisions, and revision_id is a plain
+# str (not a uuid.UUID path type, since it must also accept the literal
+# "current"), so nothing stops it from swallowing "compare" as a
+# revision_id if that route were matched first. FastAPI/Starlette match
+# in declaration order for same-shape routes.
+@router.get("/{sermon_id}/revisions/compare", response_model=RevisionCompareResponse)
+async def compare_sermon_revisions(
+    sermon_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    from_id: Annotated[str, Query()],
+    to_id: Annotated[str, Query()],
+) -> RevisionCompareResponse:
+    """Phase 8 Task 3. from_id/to_id are each either "current" or a real
+    revision UUID (as a string). Word-level diff — see
+    app/services/revision_diff.py's module docstring for why word-level
+    was chosen over line-level or sentence-level for sermon prose."""
+    sermon = await _get_owned_sermon(db, sermon_id)
+    resolved = await revisions.compare_revisions(db, sermon, from_id, to_id)
+    if resolved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or both revisions were not found")
+    from_summary, to_summary, from_content, to_content = resolved
+    diff = diff_words(from_content, to_content)
+    return RevisionCompareResponse(
+        from_revision=from_summary,
+        to_revision=to_summary,
+        diff=[DiffSegment(**seg) for seg in diff],
+    )
+
+
+@router.get("/{sermon_id}/revisions/{revision_id}", response_model=RevisionDetail)
+async def get_sermon_revision(
+    sermon_id: uuid.UUID, revision_id: str, db: Annotated[AsyncSession, Depends(get_db)]
+) -> RevisionDetail:
+    """Phase 8 Task 2: read-only full content of one past revision (or
+    "current")."""
+    sermon = await _get_owned_sermon(db, sermon_id)
+    detail = await revisions.get_revision_detail(db, sermon, revision_id)
+    if detail is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision not found")
+    return detail
+
+
+@router.post("/{sermon_id}/revisions/{revision_id}/restore", response_model=RestoreResponse)
+async def restore_sermon_revision(
+    sermon_id: uuid.UUID,
+    revision_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    tenant_id: Annotated[uuid.UUID, Depends(get_active_tenant_id)],
+) -> RestoreResponse:
+    """Phase 8 Task 4. Rejects "current" here, before ever reaching
+    revisions.restore_revision — restoring current onto itself is a
+    meaningless no-op that would still burn a revision-row snapshot for
+    nothing. Snapshot-before-overwrite and citation re-verification both
+    happen inside restore_revision itself, not left to this route or the
+    caller — see that function's own docstring."""
+    if revision_id == "current":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That's already the current version")
+    sermon = await _get_owned_sermon(db, sermon_id)
+    if sermon.content is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generate a manuscript first")
+    result = await revisions.restore_revision(db, tenant_id, sermon, revision_id)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision not found")
+    new_revision, citation_flags = result
+    # sermon.updated_at is server-computed (onupdate=func.now()) — refresh
+    # so the response's timestamp (and any future list_revisions call's
+    # "current" entry) reflects the real value, not a stale in-memory one.
+    await db.refresh(sermon)
+    return RestoreResponse(sermon=sermon, new_revision=new_revision, citation_flags=citation_flags)

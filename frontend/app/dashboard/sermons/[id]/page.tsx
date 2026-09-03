@@ -389,6 +389,15 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
                 >
                   <Download /> Download manuscript
                 </Button>
+                {/* Phase 8: version history, compare, and restore — a
+                    dedicated route, same reasoning as Preach: reviewing
+                    past versions isn't part of the active-editing flow
+                    this page is built around. */}
+                <Link href={`/dashboard/sermons/${id}/history`}>
+                  <Button size="sm" variant="outline">
+                    History
+                  </Button>
+                </Link>
               </div>
             )}
           </div>
