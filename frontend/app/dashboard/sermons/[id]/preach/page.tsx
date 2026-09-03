@@ -3,6 +3,7 @@
 import { use, useEffect, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { ArrowLeft, Loader2 } from "lucide-react";
+import { formatDeliveryEstimate } from "@/lib/timing";
 
 type Sermon = {
   id: string;
@@ -151,7 +152,12 @@ export default function PreachPage({ params }: { params: Promise<{ id: string }>
       </div>
 
       <div className="mx-auto max-w-3xl px-6 py-10">
-        <h1 className="mb-10 text-2xl font-semibold tracking-tight">{sermon.title}</h1>
+        <h1 className="mb-2 text-2xl font-semibold tracking-tight">{sermon.title}</h1>
+        {sermon.content && (
+          <p className="text-muted-foreground mb-10 text-sm print:hidden">
+            {formatDeliveryEstimate(sermon.content)} at an average pace — adjust to your own delivery.
+          </p>
+        )}
         {sermon.content ? (
           <div className="text-2xl leading-loose">{renderManuscript(sermon.content, spans)}</div>
         ) : (

@@ -38,6 +38,17 @@ httpx==0.28.1
 pypdf==6.16.2
 python-docx==1.2.0
 
+# --- PDF generation (Phase 7 Task 3: preaching-format export) ---
+# WeasyPrint, not Playwright/headless-Chromium: the manuscript is static
+# server-known text with no JS/charts to render, so a ~300MB browser
+# would be pure overhead — WeasyPrint is HTML+CSS -> PDF directly,
+# actively maintained (releases every 2-3 months), BSD-3-Clause (same
+# license bar that ruled out PyMuPDF above). Needs real system packages
+# (Pango/Cairo/GDK-PixBuf — see Dockerfile) since those can't be
+# installed via pip; that's a normal Docker-build-time apt-get, not
+# blocked by this project's dev-sandbox no-sudo constraints elsewhere.
+weasyprint==69.0
+
 # --- resilience ---
 tenacity==9.0.0
 

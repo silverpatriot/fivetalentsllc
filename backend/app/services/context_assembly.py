@@ -45,18 +45,30 @@ settings = get_settings()
 
 # Target spoken length for every generated sermon — a fixed product
 # decision for now, not per-request configurable (no length field exists
-# on GenerateRequest; revisit if that's ever needed). 130 wpm is a
-# deliberately conservative pastoral delivery pace — general public-
-# speaking averages run 120-160 wpm, and preaching tends toward the
-# slower end of that for emphasis, pauses, and congregational response —
-# so 20-25 minutes preached works out to roughly 2,600-3,250 words of
-# actual manuscript prose. The outline (both the pre-draft pass below and
-# the separate condense-from-manuscript pass in build_condense_outline_
-# messages) is scoped by point count and elaboration room for the same
-# target, not by a literal word count on the outline text itself — a
-# preacher speaks well beyond what an outline's bullets contain.
+# on GenerateRequest; revisit if that's ever needed). PREACHING_WORDS_PER_
+# MINUTE (130) is a deliberately conservative pastoral delivery pace —
+# general public-speaking averages run 120-160 wpm, and preaching tends
+# toward the slower end of that for emphasis, pauses, and congregational
+# response — so 20-25 minutes preached works out to roughly 2,600-3,250
+# words of actual manuscript prose. The outline (both the pre-draft pass
+# below and the separate condense-from-manuscript pass in build_condense_
+# outline_messages) is scoped by point count and elaboration room for the
+# same target, not by a literal word count on the outline text itself —
+# a preacher speaks well beyond what an outline's bullets contain.
+#
+# Public (no leading underscore): the Phase 7 Task 2 timing estimate is
+# computed client-side (pure word-count/wpm arithmetic, no backend call
+# needed), so this exact number is mirrored in frontend/app/dashboard/
+# sermons/[id]/preach/page.tsx with a comment pointing back here — it
+# MUST stay the same value, not an independently-chosen one, or a sermon
+# generated to hit "20-25 minutes" could report back a mismatched
+# estimate (e.g. 32 minutes) that a pastor would immediately notice and
+# lose trust in. This constant being public/named (not buried in a
+# comment, as it was before) is what makes that mirroring possible to
+# verify by reading, rather than by re-deriving from prose.
+PREACHING_WORDS_PER_MINUTE = 130
 _TARGET_MINUTES = "20-25"
-_TARGET_WORD_RANGE = "2,600-3,250"
+_TARGET_WORD_RANGE = f"{20 * PREACHING_WORDS_PER_MINUTE:,}-{25 * PREACHING_WORDS_PER_MINUTE:,}"
 
 _FORMAT_INSTRUCTIONS: dict[SermonFormat, str] = {
     SermonFormat.EXPOSITORY: (

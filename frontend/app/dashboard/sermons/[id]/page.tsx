@@ -6,6 +6,7 @@ import { Download, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { downloadText } from "@/lib/download";
+import { formatDeliveryEstimate } from "@/lib/timing";
 
 type Sermon = {
   id: string;
@@ -369,6 +370,18 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
                     Preach
                   </Button>
                 </Link>
+                {/* Phase 7 Task 3: a real PDF, formatted using the preach
+                    view's typographic intent (server-rendered in Python via
+                    WeasyPrint — see app/services/pdf_export.py — not this
+                    React markup, since WeasyPrint doesn't execute JS/CSS-in-
+                    JS). A plain anchor, not next/link: this is a real file
+                    download (backend sets Content-Disposition), not an
+                    in-app route. */}
+                <a href={`/api/sermons/${id}/pdf`}>
+                  <Button size="sm" variant="outline">
+                    <Download /> Export PDF
+                  </Button>
+                </a>
                 <Button
                   size="sm"
                   variant="outline"
@@ -379,6 +392,11 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
               </div>
             )}
           </div>
+          {sermon.content && (
+            <p className="text-muted-foreground mt-1 text-xs">
+              {formatDeliveryEstimate(sermon.content)} at an average pace — adjust to your own delivery.
+            </p>
+          )}
           <div
             ref={manuscriptRef}
             onMouseUp={generating ? undefined : handleManuscriptMouseUp}

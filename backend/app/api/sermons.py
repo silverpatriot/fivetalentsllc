@@ -12,11 +12,12 @@ that's a pre-existing gap from Phase 2, not something added or worked
 around here. Building a users-provisioning path was out of scope for this
 phase's task list; flagged in the Phase 3 completion notes.
 """
+import re
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -28,6 +29,7 @@ from app.schemas.sermon import OutlineGenerateRequest, SermonCreate, SermonRead,
 from app.services import bible
 from app.services.generation import edit_sermon_stream, generate_outline_from_manuscript, generate_sermon_stream
 from app.services.openrouter import OpenRouterError
+from app.services.pdf_export import render_sermon_pdf
 from app.services.plan_limits import MAX_EDITS_PER_SERMON, is_within_edit_cap
 
 router = APIRouter(prefix="/sermons", tags=["sermons"])
@@ -230,3 +232,34 @@ async def get_sermon_citations(
     if sermon.content is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generate a manuscript first")
     return await bible.verify_all_citations(sermon.content, translation)
+
+
+def _pdf_filename(title: str) -> str:
+    """A Content-Disposition header value is attacker-adjacent here (the
+    title is user-supplied) — CR/LF would let it inject extra headers,
+    and quotes would break out of the filename="..." value. Collapsing to
+    a conservative safe charset sidesteps both rather than trying to
+    escape them correctly inline."""
+    safe = re.sub(r"[^A-Za-z0-9 _-]", "", title).strip() or "sermon"
+    return f"{safe}.pdf"
+
+
+@router.get("/{sermon_id}/pdf")
+async def get_sermon_pdf(sermon_id: uuid.UUID, db: Annotated[AsyncSession, Depends(get_db)]) -> Response:
+    """Phase 7 Task 3: a real PDF, formatted using the preach view's
+    typographic intent — see app/services/pdf_export.py. Recomputes
+    citations fresh, same as GET /{sermon_id}/citations and for the same
+    reason (no persisted citation_flags column) — used here to italicize
+    scripture quotes in the exported PDF the same way the preach view
+    highlights them on screen.
+    """
+    sermon = await _get_owned_sermon(db, sermon_id)
+    if sermon.content is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generate a manuscript first")
+    citations = await bible.verify_all_citations(sermon.content)
+    pdf_bytes = await render_sermon_pdf(sermon.title, sermon.content, citations)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{_pdf_filename(sermon.title)}"'},
+    )
