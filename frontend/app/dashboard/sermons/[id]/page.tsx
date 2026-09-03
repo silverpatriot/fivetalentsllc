@@ -1,6 +1,7 @@
 "use client";
 
 import { use, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { Download, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -359,13 +360,23 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold">Draft</h2>
             {sermon.content && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => downloadText(`${sermon.title}.md`, sermon.content ?? "")}
-              >
-                <Download /> Download manuscript
-              </Button>
+              <div className="flex gap-2">
+                {/* Phase 7 Task 1: a separate, minimal-chrome view formatted
+                    for actually reading aloud at a pulpit — not another
+                    section on this already-busy edit page. */}
+                <Link href={`/dashboard/sermons/${id}/preach`}>
+                  <Button size="sm" variant="outline">
+                    Preach
+                  </Button>
+                </Link>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => downloadText(`${sermon.title}.md`, sermon.content ?? "")}
+                >
+                  <Download /> Download manuscript
+                </Button>
+              </div>
             )}
           </div>
           <div

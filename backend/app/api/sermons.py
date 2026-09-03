@@ -23,8 +23,9 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.deps import get_active_tenant_id, get_db
 from app.models.sermon import Sermon
-from app.schemas.generation import EditRequest, GenerateRequest
+from app.schemas.generation import CitationFlag, EditRequest, GenerateRequest
 from app.schemas.sermon import OutlineGenerateRequest, SermonCreate, SermonRead, SermonUpdate
+from app.services import bible
 from app.services.generation import edit_sermon_stream, generate_outline_from_manuscript, generate_sermon_stream
 from app.services.openrouter import OpenRouterError
 from app.services.plan_limits import MAX_EDITS_PER_SERMON, is_within_edit_cap
@@ -203,3 +204,29 @@ async def create_outline(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=exc.user_message) from exc
     await db.refresh(sermon)
     return sermon
+
+
+@router.get("/{sermon_id}/citations", response_model=list[CitationFlag])
+async def get_sermon_citations(
+    sermon_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    translation: str | None = None,
+) -> list[dict]:
+    """Phase 7 Task 1: recomputes citation verification fresh against the
+    sermon's CURRENT content — no LLM call (bible.verify_all_citations
+    only calls the Bible text source and difflib, see its own docstring),
+    no persistence, same "recompute rather than trust a cache" property
+    generate/edit already rely on.
+
+    Exists specifically because citation_flags was never a persisted
+    column — /generate and /edit's SSE `citations` event is ephemeral,
+    so a cold page load between generate/edit sessions otherwise has no
+    citation data to show at all. The preach view (Task 1) needs this to
+    highlight scripture quotes inline; confirmed real gap during the
+    Phase 7 Task 1 design pass, not something already available to
+    extend.
+    """
+    sermon = await _get_owned_sermon(db, sermon_id)
+    if sermon.content is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generate a manuscript first")
+    return await bible.verify_all_citations(sermon.content, translation)
