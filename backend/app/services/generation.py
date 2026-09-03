@@ -75,10 +75,21 @@ _EDIT_LENGTH_RATIO_MIN = 0.4
 _EDIT_LENGTH_RATIO_MAX = 2.5
 
 # A pastor explicitly asking for reformatting must not get flagged for
-# doing exactly what they asked — this is deliberately small (false
-# negatives here just mean the length-delta check is still a backstop;
-# false positives mean a legitimate "split this into two paragraphs"
-# request gets wrongly rejected, the worse failure mode).
+# doing exactly what they asked. This is a keyword allow-list, not real
+# intent detection — a KNOWN, ACCEPTED LIMITATION (2026-09-03), not an
+# oversight: an instruction that asks for restructuring without using one
+# of these words — "make this flow as two thoughts", "give this some
+# breathing room" — will still get incorrectly rejected as a false
+# structural-artifact catch. Widening the list doesn't close this, only
+# narrows it (there's always another phrasing). Accepted anyway because
+# the alternative — no bypass at all — reliably breaks EVERY restructuring
+# request, whereas this only breaks the ones that don't happen to use one
+# of these words; catching the real bug this guards against (an
+# UNREQUESTED structural change) was judged worth that residual gap. If a
+# future session is asked to "fix" this, that's the actual open problem —
+# there's no small keyword-list edit that resolves it, it needs either a
+# real intent signal (e.g. asking the model itself) or accepting the
+# tradeoff stays.
 _RESTRUCTURE_KEYWORDS = ("paragraph", "split", "section break", "line break", "restructure")
 
 
