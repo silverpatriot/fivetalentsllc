@@ -454,3 +454,137 @@ def test_edit_rejects_a_selection_that_does_not_match_current_content(
         headers=auth_headers,
     )
     assert resp.status_code == 400
+
+
+def test_edit_rejects_replacement_with_unrequested_new_paragraph_break(
+    pg_engine: Engine, active_tenant_with_org: dict, auth_headers: dict, monkeypatch
+):
+    """2026-09-03 structural-artifact guard, regression case: the exact
+    bug shape found yesterday — the model spliced a stray "\n\n" into a
+    replacement for a target span that had none, without being asked to
+    restructure anything. Must be a clean SSE error, content untouched,
+    the EDIT call itself still recorded as succeeded (it did return a
+    response — the response's content is what's untrustworthy)."""
+    tenant_id = active_tenant_with_org["id"]
+    sermon_id = _create_sermon_with_content(auth_headers)
+    start = MANUSCRIPT.index(PARAGRAPH_2)
+    end = start + len(PARAGRAPH_2)
+
+    # Same length as PARAGRAPH_2 (rules out the length-delta check firing
+    # instead) but with an unrequested paragraph break spliced in.
+    replacement = "Point two, personally:\n\nI have trusted in His timing through hardest seasons."
+
+    async def _fake_stream(model, messages, raw_sink=None):
+        yield replacement
+
+    monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    resp = client.post(
+        f"/sermons/{sermon_id}/edit",
+        json={"instruction": "make point 2 more personal", "selection": {"start": start, "end": end}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert "event: error" in resp.text
+    assert "event: citations" not in resp.text  # rejected before the splice, never reaches verification
+    assert "event: done" not in resp.text
+
+    with pg_engine.begin() as conn:
+        set_tenant(conn, tenant_id)
+        sermon_row = conn.execute(
+            sa.text("SELECT content, status FROM sermons WHERE id = :id"), {"id": sermon_id}
+        ).fetchone()
+        usage_rows = conn.execute(
+            sa.text(
+                "SELECT outcome FROM usage_events WHERE tenant_id = :tid AND sermon_id = :sid "
+                "AND generation_stage = 'edit'"
+            ),
+            {"tid": str(tenant_id), "sid": sermon_id},
+        ).fetchall()
+        revision_rows = conn.execute(
+            sa.text("SELECT 1 FROM sermon_revisions WHERE tenant_id = :tid AND sermon_id = :sid"),
+            {"tid": str(tenant_id), "sid": sermon_id},
+        ).fetchall()
+
+    assert sermon_row.content == MANUSCRIPT  # untouched — the bad replacement never got spliced in
+    assert sermon_row.status == "ready"
+    assert len(usage_rows) == 1
+    assert usage_rows[0].outcome == "succeeded"  # the LLM call worked; its output just isn't trusted
+    assert revision_rows == []  # nothing to snapshot — content was never overwritten
+
+
+def test_edit_split_into_two_paragraphs_is_not_falsely_rejected(
+    pg_engine: Engine, active_tenant_with_org: dict, auth_headers: dict, monkeypatch
+):
+    """The other half of the same guard: a pastor who explicitly asks for
+    a new paragraph break must actually get one, not be rejected for the
+    exact structural change they requested."""
+    tenant_id = active_tenant_with_org["id"]
+    sermon_id = _create_sermon_with_content(auth_headers)
+    start = MANUSCRIPT.index(PARAGRAPH_2)
+    end = start + len(PARAGRAPH_2)
+
+    replacement = (
+        "Point two: we must trust in His timing.\n\nEven when it is slow, His timing is never wasted."
+    )
+
+    async def _fake_stream(model, messages, raw_sink=None):
+        yield replacement
+
+    monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    resp = client.post(
+        f"/sermons/{sermon_id}/edit",
+        json={
+            "instruction": "split point 2 into two separate paragraphs",
+            "selection": {"start": start, "end": end},
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert "event: error" not in resp.text
+    assert "event: done" in resp.text
+
+    with pg_engine.begin() as conn:
+        set_tenant(conn, tenant_id)
+        sermon_row = conn.execute(sa.text("SELECT content FROM sermons WHERE id = :id"), {"id": sermon_id}).fetchone()
+
+    expected = f"{PARAGRAPH_1}\n\n{replacement}\n\n{PARAGRAPH_3}"
+    assert sermon_row.content == expected
+
+
+def test_edit_rejects_replacement_with_extreme_length_delta(
+    pg_engine: Engine, active_tenant_with_org: dict, auth_headers: dict, monkeypatch
+):
+    """The other signal the same guard checks: a replacement wildly
+    longer than the span it's replacing (runaway/non-scoped generation),
+    independent of the paragraph-break check above."""
+    tenant_id = active_tenant_with_org["id"]
+    sermon_id = _create_sermon_with_content(auth_headers)
+    start = MANUSCRIPT.index(PARAGRAPH_1)
+    end = start + len(PARAGRAPH_1)
+
+    runaway_replacement = "This point got rewritten far beyond its original scope. " * 20
+
+    async def _fake_stream(model, messages, raw_sink=None):
+        yield runaway_replacement
+
+    monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
+    monkeypatch.setattr("app.tasks.usage_reporting.report_usage_event.delay", lambda *a, **k: None)
+
+    resp = client.post(
+        f"/sermons/{sermon_id}/edit",
+        json={"instruction": "tighten point 1", "selection": {"start": start, "end": end}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert "event: error" in resp.text
+    assert "event: done" not in resp.text
+
+    with pg_engine.begin() as conn:
+        set_tenant(conn, tenant_id)
+        sermon_row = conn.execute(sa.text("SELECT content FROM sermons WHERE id = :id"), {"id": sermon_id}).fetchone()
+
+    assert sermon_row.content == MANUSCRIPT

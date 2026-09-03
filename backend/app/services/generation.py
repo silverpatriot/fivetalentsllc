@@ -66,9 +66,70 @@ settings = get_settings()
 # yet when both filters below were written as `!= "verified"` alone.
 _OK_CITATION_STATUSES = {"verified", "not_quoted"}
 
+# Structural-artifact guard for edit replacements (2026-09-03 proposal,
+# confirmed before building — see _check_replacement_structure). Provisional
+# band: the ratio is logged on every call, pass or fail, specifically to
+# gather real data before tightening/loosening this later rather than
+# guessing again.
+_EDIT_LENGTH_RATIO_MIN = 0.4
+_EDIT_LENGTH_RATIO_MAX = 2.5
+
+# A pastor explicitly asking for reformatting must not get flagged for
+# doing exactly what they asked — this is deliberately small (false
+# negatives here just mean the length-delta check is still a backstop;
+# false positives mean a legitimate "split this into two paragraphs"
+# request gets wrongly rejected, the worse failure mode).
+_RESTRUCTURE_KEYWORDS = ("paragraph", "split", "section break", "line break", "restructure")
+
 
 def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def _check_replacement_structure(target_span: str, replacement_text: str, instruction: str) -> str | None:
+    """Returns a user-facing failure detail if the model's replacement
+    looks like a structural artifact rather than a clean, scoped edit;
+    None if it looks fine. Two independent signals, both computed against
+    target_span (the exact original text being replaced) — same
+    "provably not a bad edit" bar the target-span verification in
+    _run_edit already applies to the INPUT side of this flow, applied
+    here to the OUTPUT side:
+
+    1. Length delta: len(replacement_text) / len(target_span) outside
+       [_EDIT_LENGTH_RATIO_MIN, _EDIT_LENGTH_RATIO_MAX] signals runaway
+       or truncated generation, not a scoped edit.
+    2. New paragraph breaks: replacement_text has MORE "\n\n" breaks
+       (this codebase's paragraph-boundary convention — see
+       chunking.py's _SEPARATORS) than target_span did. Removed breaks
+       are never flagged — consolidating/shortening is a legitimate,
+       common edit. And this signal is skipped entirely when the
+       instruction itself already asks for restructuring (see
+       _RESTRUCTURE_KEYWORDS) — a real "split this into two paragraphs"
+       request must not trip the exact guard built to catch the
+       UNREQUESTED version of the same structural change.
+    """
+    ratio = len(replacement_text) / len(target_span)
+    ratio_ok = _EDIT_LENGTH_RATIO_MIN <= ratio <= _EDIT_LENGTH_RATIO_MAX
+    logger.info(
+        "Edit replacement length ratio %.3f (band %.1fx-%.1fx): %s",
+        ratio,
+        _EDIT_LENGTH_RATIO_MIN,
+        _EDIT_LENGTH_RATIO_MAX,
+        "within band" if ratio_ok else "OUT OF BAND",
+    )
+    if not ratio_ok:
+        return "The proposed edit came back a very different length than the selected text — please try again."
+
+    target_breaks = target_span.count("\n\n")
+    replacement_breaks = replacement_text.count("\n\n")
+    requested_restructure = any(kw in instruction.lower() for kw in _RESTRUCTURE_KEYWORDS)
+    if replacement_breaks > target_breaks and not requested_restructure:
+        return (
+            "The proposed edit introduced new paragraph structure that wasn't requested — please "
+            "try again, or explicitly ask for the reformatting you want."
+        )
+
+    return None
 
 
 # Phase 6 follow-up (2026-09-02): _run_edit's locate call, and each chunk
@@ -502,6 +563,37 @@ async def _run_edit(
     await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT, "succeeded")
 
     replacement_text = "".join(replacement_chunks)
+
+    # Structural-artifact guard: the EDIT call itself succeeded (recorded
+    # above, same as a locate call that returns a span not present in the
+    # real content — separate, application-level failure) but its OUTPUT
+    # isn't trustworthy. Reject with a clean SSE error rather than splice
+    # it in — the replacement has already been streamed to the client via
+    # `delta` events by this point, so a silent retry can't undo what the
+    # UI already rendered; telling the pastor plainly and letting them
+    # re-ask is the same UX the locate-failure paths above already use.
+    structural_issue = _check_replacement_structure(target_span, replacement_text, request.instruction)
+    if structural_issue:
+        logger.warning(
+            "Sermon %s edit replacement rejected by structural-artifact guard: %s",
+            sermon.id,
+            structural_issue,
+        )
+        sermon.status = "ready"
+        db.add(
+            GenerationLog(
+                tenant_id=tenant_id,
+                sermon_id=sermon.id,
+                stage=GenerationStage.EDIT,
+                model=settings.openrouter_draft_model,
+                prompt={"messages": edit_messages},
+                raw_response="\n".join(raw_lines),
+            )
+        )
+        await db.flush()
+        yield _sse("error", {"detail": structural_issue})
+        return
+
     new_content = original_content[:start] + replacement_text + original_content[end:]
 
     # --- Step 3: verify EVERY citation in the resulting draft, full text
