@@ -85,6 +85,25 @@ export default function StudyPage() {
     loadCommentaries();
   }, []);
 
+  // 2026-09-03 real bug, confirmed live: loadDocuments() was only ever
+  // called once on mount and once right after a successful upload —
+  // nothing re-fetched afterward. Embedding is a real, ASYNC Celery job
+  // (see app/services/ingestion.py's embed_document_chunks.delay), so a
+  // document uploaded here shows "Processing…" the instant the upload
+  // response comes back, then just sits there forever on screen even
+  // though the backend genuinely finishes in under a second — confirmed
+  // via real Celery logs that the backend/embedding side was never the
+  // problem, this was. Polls only while something is actually
+  // processing, and stops itself the moment nothing is — no manual
+  // teardown bookkeeping needed, the effect just re-evaluates its own
+  // guard clause every time `documents` changes (including from a poll
+  // it just ran).
+  useEffect(() => {
+    if (!documents?.some((d) => d.status === "processing")) return;
+    const interval = setInterval(loadDocuments, 3000);
+    return () => clearInterval(interval);
+  }, [documents]);
+
   async function handleUpload(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = e.currentTarget;
