@@ -91,7 +91,7 @@ def _stub_background_tasks(monkeypatch):
     monkeypatch.setattr("app.services.ingestion.embed_document_chunks.delay", lambda *a, **k: None)
 
 
-async def _fake_outline(model, messages):
+async def _fake_outline(model, messages, **kwargs):
     return "1. Point one\n2. Point two", '{"fake":"outline"}'
 
 
@@ -102,7 +102,7 @@ def _create_sermon(auth_headers: dict, title: str = "On Contentment") -> str:
 
 
 def _generate(auth_headers: dict, sermon_id: str, draft_text: str, monkeypatch) -> None:
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         if raw_sink is not None:
             raw_sink.append(draft_text)
         yield draft_text
@@ -119,7 +119,7 @@ def _generate(auth_headers: dict, sermon_id: str, draft_text: str, monkeypatch) 
 
 
 def _edit(auth_headers: dict, sermon_id: str, instruction: str, replacement: str, start: int, end: int, monkeypatch) -> None:
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         if raw_sink is not None:
             raw_sink.append(replacement)
         yield replacement

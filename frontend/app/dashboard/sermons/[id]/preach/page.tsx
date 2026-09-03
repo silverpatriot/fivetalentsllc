@@ -18,7 +18,7 @@ type Sermon = {
 // own docstring).
 type CitationFlag = {
   reference: string;
-  status: "verified" | "not_quoted" | "invalid_reference" | "quote_mismatch";
+  status: "verified" | "not_quoted" | "invalid_reference" | "quote_mismatch" | "unverifiable";
   quoted_text: string | null;
   source_text: string | null;
   detail: string;

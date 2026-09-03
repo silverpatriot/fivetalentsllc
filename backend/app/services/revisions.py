@@ -4,6 +4,7 @@ established and the regeneration-gap fix from the Phase 8 Task 1 audit
 — this module only reads/writes sermon_revisions and sermon.content,
 no new capture logic here.
 """
+import logging
 import uuid
 
 from sqlalchemy import select
@@ -13,6 +14,8 @@ from app.models.sermon import Sermon
 from app.models.sermon_revision import SermonRevision
 from app.schemas.sermon import RevisionDetail, RevisionSummary
 from app.services import bible
+
+logger = logging.getLogger(__name__)
 
 
 def _current_summary(sermon: Sermon) -> RevisionSummary:
@@ -127,5 +130,17 @@ async def restore_revision(
     sermon.status = "ready"
     await db.flush()
 
-    citation_flags = await bible.verify_all_citations(restored_content, translation)
+    # Same defensive guard as _run/_run_edit's own citation-verification
+    # calls (2026-09-03) — the restore itself (content write + its own
+    # undo-point snapshot, both already flushed above) must not be lost
+    # because this downstream re-verification happened to break.
+    try:
+        citation_flags = await bible.verify_all_citations(restored_content, translation)
+    except Exception:
+        logger.exception(
+            "Citation verification crashed outright for sermon %s's restore — the restore itself "
+            "still succeeded, with no citation flags this pass.",
+            sermon.id,
+        )
+        citation_flags = []
     return _row_summary(pre_restore_row), citation_flags

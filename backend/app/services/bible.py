@@ -113,6 +113,21 @@ class ApiBibleError(RuntimeError):
     query and confirmed no such passage exists."""
 
 
+class BibleApiComError(RuntimeError):
+    """A genuine bible-api.com SERVICE failure — same distinction
+    ApiBibleError draws for api.bible, mirrored here (2026-09-03: this
+    function used to have NO exception handling at all — any httpx
+    error, non-404 non-2xx status, or unexpected response shape
+    propagated completely uncaught. Since bible-api.com is the FALLBACK
+    _fetch_from_api_bible's own except-block calls when api.bible itself
+    fails, and citation verification runs unguarded in generation.py's
+    _run, a transient bible-api.com hiccup during that fallback could
+    crash an otherwise-successful generation and roll back the entire
+    transaction — including a draft the pastor had already watched
+    stream to their screen. Confirmed as a real, reachable gap, not
+    just theoretical, while investigating that exact report)."""
+
+
 # Matches "John 3:16", "1 John 3:16", "I John 3:16", "First John 3:16",
 # "Song of Solomon 3:16", "Romans 8:28-30". Book names are a single
 # capitalized word, optionally prefixed by one of the ordinal forms a
@@ -208,16 +223,28 @@ async def _fetch_from_api_bible(reference: str, bible_id: str) -> ScripturePassa
 async def _fetch_from_bible_api_com(reference: str, translation: str) -> ScripturePassage | None:
     """The original Task 3 source — see module docstring. 404 means "not
     found", handled the same way as api.bible's clean not-found: an
-    authoritative answer, not an error to swallow."""
+    authoritative answer, not an error to swallow.
+
+    Everything else that can go wrong (network error, a non-404 non-2xx
+    status, an unparseable/unexpected response body) raises
+    BibleApiComError rather than propagating the raw httpx/KeyError/
+    ValueError — see that class's own docstring for why this matters:
+    this used to have no guard at all."""
     url = f"{settings.bible_api_base_url}/{reference}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, params={"translation": translation})
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params={"translation": translation})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["text"]
+    except httpx.HTTPError as exc:
+        raise BibleApiComError(f"bible-api.com request failed: {exc}") from exc
+    except (KeyError, ValueError) as exc:
+        raise BibleApiComError(f"bible-api.com returned an unexpected response shape: {exc}") from exc
     return ScripturePassage(
-        reference=data.get("reference", reference), text=data["text"], translation=translation, source="bible-api.com"
+        reference=data.get("reference", reference), text=text, translation=translation, source="bible-api.com"
     )
 
 
@@ -381,19 +408,20 @@ async def verify_citation(reference: str, draft_text: str, translation: str | No
     """Check one citation from a model-generated draft against the real
     Bible text. Returns a dict matching app.schemas.generation.CitationFlag.
 
-    Three distinct outcomes for a resolvable reference, not two — this
-    used to collapse "no quote nearby" into status="verified", which
-    conflated two different claims: "we checked the wording and it
-    matches" vs. "there was nothing to check." Confirmed live (Phase 6
-    edit-testing) that conflation had a real cost: _extract_quoted_near
-    used to fall back to searching a wide window for ANY nearby quote
-    rather than admitting there wasn't one, which could misattribute an
-    unrelated quotation elsewhere in the draft to a reference that was
-    never actually quoted. not_quoted reports that state honestly
-    instead of either flagging it as wrong or matching it against text
-    that has nothing to do with it:
+    Four distinct outcomes now, not three — this used to collapse "no
+    quote nearby" into status="verified", which conflated two different
+    claims: "we checked the wording and it matches" vs. "there was
+    nothing to check." Confirmed live (Phase 6 edit-testing) that
+    conflation had a real cost: _extract_quoted_near used to fall back
+    to searching a wide window for ANY nearby quote rather than
+    admitting there wasn't one, which could misattribute an unrelated
+    quotation elsewhere in the draft to a reference that was never
+    actually quoted. not_quoted reports that state honestly instead of
+    either flagging it as wrong or matching it against text that has
+    nothing to do with it:
       - invalid_reference: the reference itself doesn't resolve (hallucinated
-        book/chapter/verse).
+        book/chapter/verse) — BOTH sources were actually reached and BOTH
+        cleanly said "no such passage".
       - not_quoted: the reference is real, but nothing in the draft directly
         quotes it (a bare parenthetical, or a reference only mentioned in
         indirect/paraphrased prose) — not itself suspicious, and distinct
@@ -404,8 +432,31 @@ async def verify_citation(reference: str, draft_text: str, translation: str | No
         the one this app verifies against (bible_translation, KJV by
         default) — either way, a pastor should check it before preaching
         it, so it's flagged rather than guessed at.
+      - unverifiable (2026-09-03): the Bible text source(s) themselves
+        couldn't be reached — a real service failure (network error, a
+        non-2xx, an unparseable response; see BibleApiComError/
+        ApiBibleError), not evidence the reference is fake. Deliberately
+        NOT collapsed into invalid_reference (that would misreport "the
+        API had a hiccup" as "this verse doesn't exist" — exactly the
+        false alarm this feature exists to avoid) and NOT collapsed into
+        verified/not_quoted either (nothing was actually confirmed).
+        Flagged for the pastor to check manually, same bucket as
+        quote_mismatch/invalid_reference — see _OK_CITATION_STATUSES in
+        generation.py and OK_CITATION_STATUSES in page.tsx, both of
+        which this status is deliberately excluded from.
     """
-    passage = await fetch_passage(reference, translation)
+    try:
+        passage = await fetch_passage(reference, translation)
+    except (BibleApiComError, ApiBibleError, httpx.HTTPError) as exc:
+        logger.warning("Could not verify %r — Bible text source(s) unreachable: %s", reference, exc)
+        return {
+            "reference": reference,
+            "status": "unverifiable",
+            "quoted_text": None,
+            "source_text": None,
+            "detail": "Couldn't check this reference against the source text right now (a real service issue, "
+            "not a claim it's wrong) — please verify it yourself before preaching.",
+        }
     if passage is None:
         return {
             "reference": reference,

@@ -108,7 +108,7 @@ def test_edit_with_selection_splices_and_leaves_rest_untouched(
 
     replacement = "Point two, personally: I have trusted in His timing through my own hardest season."
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         for chunk in [replacement[:20], replacement[20:]]:
             if raw_sink is not None:
                 raw_sink.append(chunk)
@@ -150,10 +150,10 @@ def test_edit_without_selection_uses_locate_then_splices(
     sermon_id = _create_sermon_with_content(auth_headers)
     replacement = "Point three, expanded: real community means showing up, not just showing sympathy."
 
-    async def _fake_locate(model, messages):
+    async def _fake_locate(model, messages, **kwargs):
         return f"<<<TARGET>>>\n{PARAGRAPH_3}\n<<<END_TARGET>>>", '{"fake":"locate"}'
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         for chunk in [replacement[:20], replacement[20:]]:
             if raw_sink is not None:
                 raw_sink.append(chunk)
@@ -198,11 +198,11 @@ def test_edit_sends_sse_heartbeats_during_a_slow_locate_call(active_tenant_with_
     sermon_id = _create_sermon_with_content(auth_headers)
     monkeypatch.setattr("app.services.generation._HEARTBEAT_INTERVAL_SECONDS", 0.05)
 
-    async def _slow_locate(model, messages):
+    async def _slow_locate(model, messages, **kwargs):
         await asyncio.sleep(0.35)  # several heartbeat intervals at 0.05s each
         return f"<<<TARGET>>>\n{PARAGRAPH_1}\n<<<END_TARGET>>>", "{}"
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield "Point one, revised."
 
     monkeypatch.setattr("app.services.generation.chat_completion", _slow_locate)
@@ -233,12 +233,12 @@ def test_edit_locate_span_not_found_is_a_clean_error_not_a_silent_edit(
     tenant_id = active_tenant_with_org["id"]
     sermon_id = _create_sermon_with_content(auth_headers)
 
-    async def _fake_locate(model, messages):
+    async def _fake_locate(model, messages, **kwargs):
         return "<<<TARGET>>>\nThis sentence does not appear anywhere in the manuscript.\n<<<END_TARGET>>>", "{}"
 
     edit_call_count = {"n": 0}
 
-    async def _fail_if_called(model, messages, raw_sink=None):
+    async def _fail_if_called(model, messages, raw_sink=None, **kwargs):
         edit_call_count["n"] += 1
         raise AssertionError("the edit/rewrite call must never run when the target span wasn't found")
         yield  # pragma: no cover - unreachable, keeps this an async generator
@@ -297,7 +297,7 @@ def test_edit_introducing_a_hallucinated_citation_is_caught_by_verification(
     # to catch.
     replacement = "Point two, expanded: as it is written in Zorblatt 3:15, timing is never wasted."
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield replacement
 
     monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
@@ -335,7 +335,7 @@ def test_edit_records_non_billable_usage_event(
     start = MANUSCRIPT.index(PARAGRAPH_1)
     end = start + len(PARAGRAPH_1)
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield "Point one, revised."
 
     monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
@@ -375,7 +375,7 @@ def test_edit_snapshots_pre_edit_content_into_sermon_revisions(
     end = start + len(PARAGRAPH_1)
     instruction = "tighten point 1"
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield "Point one, revised."
 
     monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
@@ -474,7 +474,7 @@ def test_edit_rejects_replacement_with_unrequested_new_paragraph_break(
     # instead) but with an unrequested paragraph break spliced in.
     replacement = "Point two, personally:\n\nI have trusted in His timing through hardest seasons."
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield replacement
 
     monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
@@ -529,7 +529,7 @@ def test_edit_split_into_two_paragraphs_is_not_falsely_rejected(
         "Point two: we must trust in His timing.\n\nEven when it is slow, His timing is never wasted."
     )
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield replacement
 
     monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)
@@ -568,7 +568,7 @@ def test_edit_rejects_replacement_with_extreme_length_delta(
 
     runaway_replacement = "This point got rewritten far beyond its original scope. " * 20
 
-    async def _fake_stream(model, messages, raw_sink=None):
+    async def _fake_stream(model, messages, raw_sink=None, **kwargs):
         yield runaway_replacement
 
     monkeypatch.setattr("app.services.generation.stream_chat_completion", _fake_stream)

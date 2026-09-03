@@ -64,6 +64,12 @@ settings = get_settings()
 # set (rather than repeating the != "verified" check per call site) is
 # what a prior version of this file got wrong: `not_quoted` didn't exist
 # yet when both filters below were written as `!= "verified"` alone.
+#
+# `unverifiable` (2026-09-03) is DELIBERATELY NOT in this set: it means
+# the Bible text source itself couldn't be reached, not that the
+# citation was checked and found fine — same reasoning that keeps it out
+# of `verified`/`not_quoted` in bible.verify_citation's own docstring.
+# It's flagged, same bucket as invalid_reference/quote_mismatch.
 _OK_CITATION_STATUSES = {"verified", "not_quoted"}
 
 # Structural-artifact guard for edit replacements (2026-09-03 proposal,
@@ -166,18 +172,43 @@ _HEARTBEAT_INTERVAL_SECONDS = 15.0
 _SSE_HEARTBEAT = b": keepalive\n\n"
 
 
-async def _heartbeat_while_pending(task: "asyncio.Task", interval: float) -> AsyncIterator[bytes]:
+async def _heartbeat_while_pending(
+    task: "asyncio.Task", interval: float, retry_queue: "asyncio.Queue[dict] | None" = None
+) -> AsyncIterator[bytes]:
     """Yields a raw SSE comment line (`: keepalive\n\n` — valid SSE
     syntax every real client silently ignores; EventSource never fires
     an event for a comment line) every `interval` seconds for as long as
     `task` is still running. Does NOT retrieve `task`'s result or
     exception — the caller awaits `task` itself once this generator is
     exhausted (awaiting an already-done task returns/raises immediately,
-    no extra delay)."""
-    while not task.done():
-        _, pending = await asyncio.wait({task}, timeout=interval)
-        if task in pending:
-            yield _SSE_HEARTBEAT
+    no extra delay).
+
+    `retry_queue`, if given (see openrouter.py's _notify_retry), is
+    watched alongside `task` and any item on it is yielded as a real
+    `event: retry` SSE frame IMMEDIATELY — not held until the next
+    `interval` tick, since a real retry delay (1s/2s backoff) is usually
+    shorter than `interval` itself. 2026-09-03: this is what makes an
+    OpenRouter retry sequence visible to the pastor as "retrying (2/3)…"
+    instead of an unexplained silent wait indistinguishable from
+    "broken" — confirmed live that the silent version reads that way in
+    practice, not just in theory."""
+    queue_get: "asyncio.Task | None" = None
+    try:
+        while not task.done():
+            waitables = {task}
+            if retry_queue is not None:
+                if queue_get is None:
+                    queue_get = asyncio.ensure_future(retry_queue.get())
+                waitables.add(queue_get)
+            done, _ = await asyncio.wait(waitables, timeout=interval, return_when=asyncio.FIRST_COMPLETED)
+            if queue_get is not None and queue_get in done:
+                yield _sse("retry", queue_get.result())
+                queue_get = None
+            elif task not in done:
+                yield _SSE_HEARTBEAT
+    finally:
+        if queue_get is not None and not queue_get.done():
+            queue_get.cancel()
 
 
 async def _record_llm_call(
@@ -269,19 +300,41 @@ async def _run(
     )
 
     # --- Outline pass: cheap/fast model, not streamed (it's quick, and
-    # the frontend only needs the final outline text, not its tokens). ---
+    # the frontend only needs the final outline text, not its tokens).
+    #
+    # Heartbeat-protected (2026-09-03 fix): "quick" assumed no retries —
+    # under real OpenRouter congestion (confirmed live, 2 retries at
+    # 1s/2s backoff observed, sometimes more) a plain `await` here sends
+    # ZERO bytes to the client for that whole window. _run_edit's locate
+    # call already had this exact protection (same shape of call, same
+    # risk) — this brings _run's outline call in line with it, closing
+    # the gap between "fixed there" and "not fixed here" for what is
+    # otherwise the identical failure mode. Same orphaned-task cancel-on-
+    # teardown reasoning as _run_edit's locate call applies here too. ---
     outline_messages = build_outline_messages(ctx)
+    outline_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+    outline_task = asyncio.ensure_future(
+        chat_completion(settings.openrouter_outline_model, outline_messages, retry_queue=outline_retry_queue)
+    )
     try:
-        outline_text, outline_raw = await chat_completion(settings.openrouter_outline_model, outline_messages)
-    except OpenRouterError as exc:
-        logger.exception("Outline generation failed for sermon %s", sermon.id)
-        sermon.status = "draft"
-        await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "failed")
-        # logger.exception above has the raw upstream detail; the SSE
-        # event a pastor's browser actually renders gets the sanitized
-        # message instead — see OpenRouterError.user_message's docstring.
-        yield _sse("error", {"detail": exc.user_message})
-        return
+        async for heartbeat in _heartbeat_while_pending(
+            outline_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=outline_retry_queue
+        ):
+            yield heartbeat
+        try:
+            outline_text, outline_raw = await outline_task
+        except OpenRouterError as exc:
+            logger.exception("Outline generation failed for sermon %s", sermon.id)
+            sermon.status = "draft"
+            await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "failed")
+            # logger.exception above has the raw upstream detail; the SSE
+            # event a pastor's browser actually renders gets the sanitized
+            # message instead — see OpenRouterError.user_message's docstring.
+            yield _sse("error", {"detail": exc.user_message})
+            return
+    finally:
+        if not outline_task.done():
+            outline_task.cancel()
 
     await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "succeeded")
 
@@ -299,14 +352,41 @@ async def _run(
     yield _sse("outline", {"text": outline_text})
 
     # --- Draft pass: stronger model, streamed token-by-token so a 30+
-    # second generation isn't silent. ---
+    # second generation isn't silent.
+    #
+    # Heartbeat-protected per-chunk (2026-09-03 fix), mirroring
+    # _run_edit's identical draft-streaming loop exactly: a plain
+    # `async for` over stream_chat_completion sends nothing to the
+    # client during a slow start or a slow gap between tokens (both
+    # observed live under real OpenRouter congestion) — this is very
+    # likely what actually produced a real report's "Error in input
+    # stream" (a chunked response gone silent long enough for the
+    # connection to be treated as dead), on a request whose OUTLINE had
+    # already streamed successfully to the pastor's screen before the
+    # draft call went silent. Also fixes the same orphaned-task-on-
+    # teardown gap _run_edit's version was fixed for. ---
     draft_messages = build_draft_messages(ctx, outline_text)
     draft_chunks: list[str] = []
     raw_lines: list[str] = []
+    draft_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+    stream_iter = stream_chat_completion(
+        settings.openrouter_draft_model, draft_messages, raw_sink=raw_lines, retry_queue=draft_retry_queue
+    ).__aiter__()
     try:
-        async for delta in stream_chat_completion(
-            settings.openrouter_draft_model, draft_messages, raw_sink=raw_lines
-        ):
+        while True:
+            next_task = asyncio.ensure_future(stream_iter.__anext__())
+            try:
+                async for heartbeat in _heartbeat_while_pending(
+                    next_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=draft_retry_queue
+                ):
+                    yield heartbeat
+                try:
+                    delta = await next_task
+                except StopAsyncIteration:
+                    break
+            finally:
+                if not next_task.done():
+                    next_task.cancel()
             draft_chunks.append(delta)
             yield _sse("delta", {"text": delta})
     except OpenRouterError as exc:
@@ -322,7 +402,29 @@ async def _run(
 
     # --- Trust and accuracy: verify every citation before it's shown,
     # never trust the model's memory of scripture text. ---
-    citation_flags = await bible.verify_all_citations(draft_text, request.translation)
+    # Defensive, in addition to (not instead of) fixing the specific gap
+    # this uncovered (bible.py's _fetch_from_bible_api_com used to have
+    # NO exception handling at all — see BibleApiComError). Everything
+    # from here through the final `sermon.content = draft_text` write
+    # MUST still happen even if citation verification breaks in some
+    # way neither of those fixes anticipated: an uncaught exception here
+    # used to roll back the ENTIRE transaction, silently destroying a
+    # draft the pastor had already watched stream to their screen, with
+    # zero trace (confirmed 2026-09-03: a real report reproduced this
+    # exact shape — see the generation_logs table left completely empty
+    # for the affected sermon). The draft is worth more than a citation
+    # check that happened to fail.
+    try:
+        citation_flags = await bible.verify_all_citations(draft_text, request.translation)
+    except Exception:
+        logger.exception(
+            "Citation verification crashed outright for sermon %s — saving the draft anyway, "
+            "with no citation flags this pass (GET /sermons/%s/citations will retry cleanly later).",
+            sermon.id,
+            sermon.id,
+        )
+        citation_flags = []
+
     flagged = [f for f in citation_flags if f["status"] not in _OK_CITATION_STATUSES]
     if flagged:
         logger.warning(
@@ -376,15 +478,27 @@ async def _run(
     # to the pastor, and an extra OpenRouter round trip to embed the
     # sermon for FUTURE cadence-matching searches has no reason to hold
     # it up.
-    await ingest_text(
-        db,
-        tenant_id,
-        corpus_type=CorpusType.CADENCE.value,
-        source=DocumentSource.GENERATED.value,
-        title=sermon.title,
-        text=draft_text,
-        sermon_id=sermon.id,
-    )
+    #
+    # Same "the draft is already saved, don't lose it over a downstream
+    # failure" guard as citation verification above — this is a nice-to-
+    # have for FUTURE cadence matching, not something worth risking an
+    # already-successful, already-saved generation over.
+    try:
+        await ingest_text(
+            db,
+            tenant_id,
+            corpus_type=CorpusType.CADENCE.value,
+            source=DocumentSource.GENERATED.value,
+            title=sermon.title,
+            text=draft_text,
+            sermon_id=sermon.id,
+        )
+    except Exception:
+        logger.exception(
+            "Cadence-corpus ingestion failed for sermon %s — draft is already saved; this only "
+            "affects future cadence-matching for this one sermon.",
+            sermon.id,
+        )
 
     yield _sse("citations", {"flags": citation_flags})
 
@@ -513,20 +627,39 @@ async def _run_edit(
         target_span = original_content[start:end]
     else:
         locate_messages = build_locate_messages(original_content, request.instruction)
+        locate_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         locate_task = asyncio.ensure_future(
-            chat_completion(settings.openrouter_outline_model, locate_messages)
+            chat_completion(settings.openrouter_outline_model, locate_messages, retry_queue=locate_retry_queue)
         )
-        async for heartbeat in _heartbeat_while_pending(locate_task, _HEARTBEAT_INTERVAL_SECONDS):
-            yield heartbeat
+        # 2026-09-03 fix: if this generator gets torn down before
+        # locate_task resolves (a client disconnect — confirmed live,
+        # reproduced against a real "GET Task exception was never
+        # retrieved" asyncio warning during investigation — Starlette
+        # closes an abandoned StreamingResponse generator, which raises
+        # GeneratorExit at whichever yield is currently suspended, i.e.
+        # inside the heartbeat loop below), locate_task previously kept
+        # running orphaned in the background with nothing left to ever
+        # await it — its eventual exception silently swallowed by
+        # asyncio instead of anywhere this app could see it. The finally
+        # below cancels it instead, so a torn-down request can't leak a
+        # background task or hide a failure this way.
         try:
-            locate_raw_text, locate_raw = await locate_task
-        except OpenRouterError as exc:
-            logger.exception("Edit-locate failed for sermon %s", sermon.id)
-            sermon.status = "ready"
-            await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT_LOCATE, "failed")
-            await db.flush()
-            yield _sse("error", {"detail": exc.user_message})
-            return
+            async for heartbeat in _heartbeat_while_pending(
+                locate_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=locate_retry_queue
+            ):
+                yield heartbeat
+            try:
+                locate_raw_text, locate_raw = await locate_task
+            except OpenRouterError as exc:
+                logger.exception("Edit-locate failed for sermon %s", sermon.id)
+                sermon.status = "ready"
+                await _record_llm_call(tenant_id, sermon.id, GenerationStage.EDIT_LOCATE, "failed")
+                await db.flush()
+                yield _sse("error", {"detail": exc.user_message})
+                return
+        finally:
+            if not locate_task.done():
+                locate_task.cancel()
 
         # The API call itself succeeded — outcome tracks call success,
         # same convention as DRAFT (a flagged citation doesn't make a
@@ -577,18 +710,29 @@ async def _run_edit(
     # same silent-gap shape as the locate call above, and an unusually
     # slow gap between tokens gets the same protection for free, at no
     # cost when tokens are actually flowing normally.
+    edit_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
     stream_iter = stream_chat_completion(
-        settings.openrouter_draft_model, edit_messages, raw_sink=raw_lines
+        settings.openrouter_draft_model, edit_messages, raw_sink=raw_lines, retry_queue=edit_retry_queue
     ).__aiter__()
     try:
         while True:
             next_task = asyncio.ensure_future(stream_iter.__anext__())
-            async for heartbeat in _heartbeat_while_pending(next_task, _HEARTBEAT_INTERVAL_SECONDS):
-                yield heartbeat
+            # Same orphaned-task fix as the locate call above, applied
+            # per-chunk here: a client disconnect mid-stream must cancel
+            # whichever next_task is currently in flight, not leave it
+            # running with nothing left to retrieve its result/exception.
             try:
-                delta = await next_task
-            except StopAsyncIteration:
-                break
+                async for heartbeat in _heartbeat_while_pending(
+                    next_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=edit_retry_queue
+                ):
+                    yield heartbeat
+                try:
+                    delta = await next_task
+                except StopAsyncIteration:
+                    break
+            finally:
+                if not next_task.done():
+                    next_task.cancel()
             replacement_chunks.append(delta)
             yield _sse("delta", {"text": delta})
     except OpenRouterError as exc:
@@ -639,8 +783,21 @@ async def _run_edit(
     # — same call, same place in the flow, as original generation. An
     # edit that introduces a new (possibly hallucinated) reference gets
     # caught exactly like one would in a fresh draft; one anywhere else
-    # in the untouched text is re-confirmed too, cheaply (no LLM cost). ---
-    citation_flags = await bible.verify_all_citations(new_content, request.translation)
+    # in the untouched text is re-confirmed too, cheaply (no LLM cost).
+    #
+    # Same defensive guard as _run's own citation-verification call
+    # (2026-09-03) — an edit that's already passed the structural-
+    # artifact guard and is otherwise good must not be lost because a
+    # DOWNSTREAM citation check happened to break. ---
+    try:
+        citation_flags = await bible.verify_all_citations(new_content, request.translation)
+    except Exception:
+        logger.exception(
+            "Citation verification crashed outright for sermon %s's edit — saving the edit anyway, "
+            "with no citation flags this pass.",
+            sermon.id,
+        )
+        citation_flags = []
     flagged = [f for f in citation_flags if f["status"] not in _OK_CITATION_STATUSES]
     if flagged:
         logger.warning(

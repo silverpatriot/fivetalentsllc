@@ -29,14 +29,35 @@ type CitationFlag = {
   // prose) — nothing was checked, so nothing failed. Distinct from
   // "verified" (wording actually checked and matched); grouped with it
   // for styling/counting purposes below (see OK_CITATION_STATUSES).
-  status: "verified" | "not_quoted" | "invalid_reference" | "quote_mismatch";
+  status: "verified" | "not_quoted" | "invalid_reference" | "quote_mismatch" | "unverifiable";
   quoted_text: string | null;
   source_text: string | null;
   detail: string;
 };
 
+// A real OpenRouter retry sequence, surfaced (2026-09-03) — see
+// app/services/openrouter.py's _notify_retry and generation.py's
+// _heartbeat_while_pending. Without this, a pastor watching "Revising…"
+// during real retries had nothing to distinguish "slow but working"
+// from "broken" — confirmed live that the silent version reads as the
+// latter in practice.
+type RetryStatus = {
+  attempt: number;
+  max_attempts: number;
+  delay_seconds: number;
+  status_code: number | null;
+  reason: string;
+};
+
+function retryStatusMessage(r: RetryStatus): string {
+  const cause = r.status_code === 429 ? "at capacity" : r.reason === "network_error" ? "unreachable" : "having trouble";
+  return `The AI service is ${cause} — retrying (attempt ${r.attempt + 1} of ${r.max_attempts})…`;
+}
+
 // Mirrors app/services/generation.py's _OK_CITATION_STATUSES — statuses
 // that mean "nothing wrong here", not a real problem to flag.
+// "unverifiable" (2026-09-03) is deliberately excluded — the source
+// couldn't be reached, which is flagged for review, not "confirmed fine".
 const OK_CITATION_STATUSES = new Set(["verified", "not_quoted"]);
 
 // Parses the backend's Server-Sent-Events stream (see
@@ -104,6 +125,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
   const [draftOutline, setDraftOutline] = useState<string | null>(null);
   const [draftText, setDraftText] = useState("");
   const [citations, setCitations] = useState<CitationFlag[] | null>(null);
+  const [genRetryStatus, setGenRetryStatus] = useState<RetryStatus | null>(null);
   const draftRef = useRef("");
 
   const [creatingOutline, setCreatingOutline] = useState(false);
@@ -121,6 +143,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
   const [editInstruction, setEditInstruction] = useState("");
   const [editing, setEditing] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+  const [editRetryStatus, setEditRetryStatus] = useState<RetryStatus | null>(null);
   // The span the backend actually locked onto (echoed back via the
   // `target` SSE event) — same thing as editSelection when the pastor
   // selected text themselves, but this is the only way to see it when
@@ -151,6 +174,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
     setDraftOutline(null);
     setDraftText("");
     setCitations(null);
+    setGenRetryStatus(null);
     draftRef.current = "";
 
     try {
@@ -177,6 +201,11 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
         const { frames, rest } = parseSseChunk(buffer);
         buffer = rest;
         for (const frame of frames) {
+          if (frame.event === "retry") {
+            setGenRetryStatus(frame.data as RetryStatus);
+            continue; // don't fall through to the retry-clearing branches below
+          }
+          setGenRetryStatus(null); // any other event means real progress happened
           if (frame.event === "outline") {
             setDraftOutline((frame.data as { text: string }).text);
           } else if (frame.event === "delta") {
@@ -195,6 +224,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
       setGenError(e instanceof Error ? e.message : "Generation failed");
     } finally {
       setGenerating(false);
+      setGenRetryStatus(null);
     }
   }
 
@@ -248,6 +278,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
     setEditError(null);
     setEditTarget(null);
     setEditPreview("");
+    setEditRetryStatus(null);
     editPreviewRef.current = "";
 
     try {
@@ -274,6 +305,11 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
         const { frames, rest } = parseSseChunk(buffer);
         buffer = rest;
         for (const frame of frames) {
+          if (frame.event === "retry") {
+            setEditRetryStatus(frame.data as RetryStatus);
+            continue;
+          }
+          setEditRetryStatus(null);
           if (frame.event === "target") {
             setEditTarget(frame.data as { start: number; end: number; text: string });
           } else if (frame.event === "delta") {
@@ -300,6 +336,7 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
       setEditError(e instanceof Error ? e.message : "Edit failed");
     } finally {
       setEditing(false);
+      setEditRetryStatus(null);
     }
   }
 
@@ -343,6 +380,12 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
             {generating ? "Generating…" : "Generate sermon"}
           </Button>
         </form>
+      )}
+
+      {genRetryStatus && (
+        <div className="bg-secondary/50 flex items-center gap-1.5 rounded-lg p-3 text-sm">
+          <Loader2 className="size-4 animate-spin" /> {retryStatusMessage(genRetryStatus)}
+        </div>
       )}
 
       {genError && (
@@ -458,6 +501,12 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
               {editing ? "Revising…" : "Apply edit"}
             </Button>
           </form>
+
+          {editRetryStatus && (
+            <div className="bg-secondary/50 flex items-center gap-1.5 rounded-lg p-2 text-xs">
+              <Loader2 className="size-3.5 animate-spin" /> {retryStatusMessage(editRetryStatus)}
+            </div>
+          )}
 
           {editError && (
             <div className="bg-destructive/10 text-destructive rounded-lg p-3 text-sm">{editError}</div>

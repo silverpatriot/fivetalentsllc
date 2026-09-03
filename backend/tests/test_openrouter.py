@@ -136,3 +136,77 @@ async def test_stream_chat_completion_retries_a_429_before_any_delta_and_succeed
 
     assert deltas == ["Hello ", "world."]
     assert len(calls) == 2
+
+
+async def test_chat_completion_reports_each_retry_on_the_queue(monkeypatch):
+    """2026-09-03: retry_queue is what makes a real OpenRouter retry
+    sequence visible to the pastor (a real "retrying (2/3)…" status)
+    instead of a silent wait indistinguishable from broken — see
+    app/services/generation.py's _heartbeat_while_pending, which drains
+    this same queue and turns each item into a real SSE `retry` event."""
+    import asyncio
+
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return _rate_limited_response() if len(calls) < 3 else _ok_json_response("Third attempt worked.")
+
+    _install_mock_transport(monkeypatch, handler)
+    _install_fast_sleep(monkeypatch)
+
+    retry_queue: asyncio.Queue = asyncio.Queue()
+    text, _raw = await chat_completion("some/model", [{"role": "user", "content": "hi"}], retry_queue=retry_queue)
+
+    assert text == "Third attempt worked."
+    events = []
+    while not retry_queue.empty():
+        events.append(retry_queue.get_nowait())
+    assert len(events) == 2  # 2 retries before the 3rd attempt succeeded
+    assert events[0] == {"attempt": 1, "max_attempts": 3, "delay_seconds": 1.0, "status_code": 429, "reason": "upstream_error"}
+    assert events[1]["attempt"] == 2
+
+
+async def test_chat_completion_with_no_retry_queue_behaves_exactly_as_before(monkeypatch):
+    """retry_queue is purely additive — every existing caller that
+    doesn't pass one must be completely unaffected."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return _rate_limited_response() if len(calls) == 1 else _ok_json_response("worked")
+
+    _install_mock_transport(monkeypatch, handler)
+    _install_fast_sleep(monkeypatch)
+
+    text, _raw = await chat_completion("some/model", [{"role": "user", "content": "hi"}])
+    assert text == "worked"
+
+
+async def test_stream_chat_completion_reports_retry_on_the_queue(monkeypatch):
+    import asyncio
+
+    calls: list[httpx.Request] = []
+    sse_body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n' b"data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return _rate_limited_response()
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+
+    _install_mock_transport(monkeypatch, handler)
+    _install_fast_sleep(monkeypatch)
+
+    retry_queue: asyncio.Queue = asyncio.Queue()
+    deltas = [
+        d
+        async for d in stream_chat_completion(
+            "some/model", [{"role": "user", "content": "hi"}], retry_queue=retry_queue
+        )
+    ]
+
+    assert deltas == ["ok"]
+    event = retry_queue.get_nowait()
+    assert event["attempt"] == 1
+    assert event["status_code"] == 429

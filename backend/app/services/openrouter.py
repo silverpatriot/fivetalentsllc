@@ -95,9 +95,32 @@ def _retry_delay(attempt: int, headers: httpx.Headers | None) -> float:
     return _BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
 
 
-async def chat_completion(model: str, messages: list[dict[str, str]]) -> tuple[str, str]:
+async def _notify_retry(
+    retry_queue: "asyncio.Queue[dict] | None", attempt: int, delay: float, *, status_code: int | None, reason: str
+) -> None:
+    """Pushes a plain data dict (never SSE-encoded bytes — this module
+    stays agnostic of the app's own SSE event shape; app/services/
+    generation.py owns that encoding when it drains the queue) describing
+    a retry that's about to happen. 2026-09-03: this is what makes a
+    real OpenRouter retry sequence VISIBLE to the pastor instead of an
+    unexplained silent "Revising…"/heartbeat-only wait — confirmed live
+    that the latter reads as "broken" during genuine (if temporary)
+    upstream capacity trouble, not just theoretically."""
+    if retry_queue is not None:
+        await retry_queue.put(
+            {"attempt": attempt, "max_attempts": _MAX_ATTEMPTS, "delay_seconds": delay, "status_code": status_code, "reason": reason}
+        )
+
+
+async def chat_completion(
+    model: str, messages: list[dict[str, str]], retry_queue: "asyncio.Queue[dict] | None" = None
+) -> tuple[str, str]:
     """Non-streaming call. Returns (text, raw_response_json_str) — the raw
-    string is what gets persisted to generation_logs verbatim."""
+    string is what gets persisted to generation_logs verbatim.
+
+    `retry_queue`, if given, receives one dict (see _notify_retry) per
+    retry — optional and purely additive, every existing caller that
+    doesn't pass one behaves exactly as before."""
     api_key = _require_api_key()
     attempt = 0
     while True:
@@ -111,8 +134,10 @@ async def chat_completion(model: str, messages: list[dict[str, str]]) -> tuple[s
                 )
         except httpx.TransportError as exc:
             if attempt < _MAX_ATTEMPTS:
+                delay = _retry_delay(attempt, None)
                 logger.warning("OpenRouter network error (attempt %d/%d): %s — retrying", attempt, _MAX_ATTEMPTS, exc)
-                await asyncio.sleep(_retry_delay(attempt, None))
+                await _notify_retry(retry_queue, attempt, delay, status_code=None, reason="network_error")
+                await asyncio.sleep(delay)
                 continue
             raise OpenRouterError(f"Network error calling OpenRouter: {exc}") from exc
 
@@ -121,6 +146,7 @@ async def chat_completion(model: str, messages: list[dict[str, str]]) -> tuple[s
             logger.warning(
                 "OpenRouter %s (attempt %d/%d) — retrying in %.1fs", resp.status_code, attempt, _MAX_ATTEMPTS, delay
             )
+            await _notify_retry(retry_queue, attempt, delay, status_code=resp.status_code, reason="upstream_error")
             await asyncio.sleep(delay)
             continue
 
@@ -137,7 +163,10 @@ async def chat_completion(model: str, messages: list[dict[str, str]]) -> tuple[s
 
 
 async def stream_chat_completion(
-    model: str, messages: list[dict[str, str]], raw_sink: list[str] | None = None
+    model: str,
+    messages: list[dict[str, str]],
+    raw_sink: list[str] | None = None,
+    retry_queue: "asyncio.Queue[dict] | None" = None,
 ) -> AsyncIterator[str]:
     """Streaming call (SSE). Yields text deltas as they arrive.
 
@@ -146,6 +175,10 @@ async def stream_chat_completion(
     build the full raw_response persisted to generation_logs, since the
     exact bytes the model returned are what "log what came back" (Task 3)
     means, not just the reassembled text.
+
+    `retry_queue`, if given, receives one dict (see _notify_retry) per
+    retry — optional and purely additive, every existing caller that
+    doesn't pass one behaves exactly as before.
 
     Retries (see module docstring) only happen before the first delta of
     an attempt has been yielded — the retryable-status check runs right
@@ -174,6 +207,9 @@ async def stream_chat_completion(
                             "OpenRouter %s (attempt %d/%d) — retrying in %.1fs",
                             resp.status_code, attempt, _MAX_ATTEMPTS, delay,
                         )
+                        await _notify_retry(
+                            retry_queue, attempt, delay, status_code=resp.status_code, reason="upstream_error"
+                        )
                         await asyncio.sleep(delay)
                         continue
                     if resp.status_code >= 400:
@@ -200,7 +236,9 @@ async def stream_chat_completion(
                     return
         except httpx.TransportError as exc:
             if not yielded_any and attempt < _MAX_ATTEMPTS:
+                delay = _retry_delay(attempt, None)
                 logger.warning("OpenRouter network error (attempt %d/%d): %s — retrying", attempt, _MAX_ATTEMPTS, exc)
-                await asyncio.sleep(_retry_delay(attempt, None))
+                await _notify_retry(retry_queue, attempt, delay, status_code=None, reason="network_error")
+                await asyncio.sleep(delay)
                 continue
             raise OpenRouterError(f"Network error calling OpenRouter: {exc}") from exc

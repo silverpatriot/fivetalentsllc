@@ -70,11 +70,11 @@ def auth_headers(rsa_keypair: tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey], active
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _fake_chat_completion(model: str, messages: list[dict]) -> tuple[str, str]:
+async def _fake_chat_completion(model: str, messages: list[dict], **kwargs) -> tuple[str, str]:
     return "1. Point one\n2. Point two\n3. Point three", '{"fake":"outline-response"}'
 
 
-async def _fake_stream_chat_completion(model: str, messages: list[dict], raw_sink: list[str] | None = None):
+async def _fake_stream_chat_completion(model: str, messages: list[dict], raw_sink: list[str] | None = None, **kwargs):
     for chunk in ["In the beginning, ", "God created the heavens and the earth."]:
         if raw_sink is not None:
             raw_sink.append(chunk)
@@ -164,7 +164,7 @@ def test_generate_records_a_failed_usage_event_when_outline_errors(
     invented for the draft stage, which never ran."""
     tenant_id = active_tenant_with_org["id"]
 
-    async def _boom(model, messages):
+    async def _boom(model, messages, **kwargs):
         from app.services.openrouter import OpenRouterError
 
         raise OpenRouterError("simulated outline failure")
@@ -229,7 +229,7 @@ def test_create_outline_persists_and_records_generation_log(
     )
     assert gen_resp.status_code == 200, gen_resp.text
 
-    async def _fake_condense(model, messages):
+    async def _fake_condense(model, messages, **kwargs):
         # Cites a real, resolvable reference — proves the appended
         # "Scripture Referenced" block carries genuine, verified text,
         # not just that persistence works at all.
