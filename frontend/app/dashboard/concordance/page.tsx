@@ -21,6 +21,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 
 type TranslationOption = { code: string; label: string };
 
+function translationLabel(code: string, translations: TranslationOption[] | null): string {
+  return translations?.find((t) => t.code === code)?.label ?? code.toUpperCase();
+}
+
 type ConcordanceVerse = { reference: string; text: string; translation: string };
 type ConcordanceWebResult = { title: string; url: string; content: string };
 
@@ -78,6 +82,20 @@ export default function ConcordancePage() {
         <p className="text-muted-foreground mt-1 text-sm">
           Find every verse containing a word — exact and stemmed matches, not a topic search.
         </p>
+        {/* 2026-09-03: clear framing, confirmed necessary during a real
+            walkthrough — this is an English-word search against the
+            translation text itself (Postgres full-text search with
+            English stemming), NOT a Strong's-number/original-language
+            concordance. It can't distinguish different underlying
+            Hebrew/Greek words that happen to share an English
+            translation — real Strong's integration doesn't exist in
+            this app yet (a separate, later feature, not built here). */}
+        <p className="text-muted-foreground mt-1 text-xs">
+          This is an English-word search — it matches the translation&apos;s own English text (with basic
+          stemming, e.g. &ldquo;believing&rdquo; matches &ldquo;believe&rdquo;), not a Strong&apos;s-number or
+          original-language (Hebrew/Greek) search. Different Hebrew or Greek words that happen to share the
+          same English translation aren&apos;t distinguished here.
+        </p>
       </div>
 
       <form onSubmit={handleSearch} className="flex items-center gap-2">
@@ -114,9 +132,16 @@ export default function ConcordancePage() {
 
       {result && (
         <div className="flex flex-col gap-6">
-          {result.local_matches.length === 0 ? (
-            <p className="text-muted-foreground text-sm">No matches in {result.translation.toUpperCase()}.</p>
-          ) : (
+          {/* 2026-09-03: previously this label only ever rendered in the
+              empty-"no matches" case below — a real search WITH results
+              (the common case) showed nothing confirming which
+              translation was actually searched. Now shown consistently,
+              matches or not. */}
+          <p className="text-muted-foreground text-xs">
+            {result.local_matches.length} match{result.local_matches.length === 1 ? "" : "es"} in{" "}
+            {translationLabel(result.translation, translations)}.
+          </p>
+          {result.local_matches.length === 0 ? null : (
             <Table>
               <TableHeader>
                 <TableRow>
