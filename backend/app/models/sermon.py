@@ -37,8 +37,12 @@ class Sermon(Base, UUIDPkMixin, CreatedAtMixin):
     # (context_assembly.build_outline_messages) — that one is streamed to
     # the frontend and never persisted; this is the real, saved artifact.
     outline: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Free-form status (draft/generating/ready/published/...) — deliberately
-    # not a native enum yet; the state machine isn't locked in this phase.
+    # Free-form status (draft/generating/interrupted/ready/published/...) —
+    # deliberately not a native enum yet; the state machine isn't locked in
+    # this phase. "interrupted" (2026-09-04) means a generation attempt
+    # was cut short by the client disconnecting mid-stream (not a failure,
+    # not "never attempted") — see app/services/generation.py's `_run`,
+    # `except (GeneratorExit, asyncio.CancelledError)` clause.
     status: Mapped[str] = mapped_column(String(50), nullable=False, server_default="draft")
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

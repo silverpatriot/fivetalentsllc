@@ -21,6 +21,10 @@ async function getSermons(): Promise<Sermon[]> {
 const STATUS_LABEL: Record<string, string> = {
   draft: "Draft",
   generating: "Generating…",
+  // 2026-09-04: an attempt was cut short by a disconnect mid-stream, not
+  // a failure and not "never attempted" — see app/services/generation.py
+  // (backend)'s `_run`, `except (GeneratorExit, asyncio.CancelledError)`.
+  interrupted: "Interrupted — retry",
   ready: "Ready for review",
   published: "Published",
 };

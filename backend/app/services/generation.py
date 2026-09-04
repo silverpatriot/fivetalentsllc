@@ -27,6 +27,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 
+import anyio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -216,18 +217,20 @@ async def _record_llm_call(
 ) -> None:
     """One usage_events row per real LLM call — outline, draft, and
     outline_condense each record their own, independently, regardless of
-    success/failure. This is the raw ledger of what actually happened
-    (Phase 3 completion review's decision); billable is the actual
-    billing decision (Phase 5), and only DRAFT rows ever carry it:
+    success/failure/interruption. This is the raw ledger of what actually
+    happened (Phase 3 completion review's decision); billable is the
+    actual billing decision (Phase 5), and only DRAFT rows ever carry it:
 
     A completed sermon (one DRAFT succeeding) is the metered unit — see
     app/services/plan_limits.py's is_within_sermon_quota. OUTLINE is a
     sub-step of that same sermon, not a second billable thing, and
     OUTLINE_CONDENSE (regenerating a preaching outline afterward) is a
     free follow-up on a sermon already accounted for — neither stage
-    checks quota; both always record billable=False. A failed DRAFT is
-    also never billable — it produced no sermon, so it can't be overage,
-    and doesn't consume the tenant's quota either.
+    checks quota; both always record billable=False. A failed or
+    interrupted (2026-09-04 — the client disconnected mid-stream; see
+    _run's `except (GeneratorExit, asyncio.CancelledError)`) DRAFT is also
+    never billable — it produced no sermon, so it can't be overage, and
+    doesn't consume the tenant's quota either.
 
     A metering hiccup must never lose a generation that otherwise
     succeeded (or its error state) — same protective try/except as the
@@ -257,13 +260,17 @@ async def generate_sermon_stream(
     async with tenant_session(tenant_id) as db:
         async for event in _run(db, tenant_id, sermon_id, request):
             yield event
-        # Reaching here means every step below either completed or was
+        # Reaching here means every step above either completed, was
         # caught and handled (status reverted to 'draft', a partial
-        # generation_logs row kept) — either way there's something worth
-        # committing rather than losing. An uncaught exception instead
-        # propagates out of `async with tenant_session`, which rolls the
-        # whole transaction back — an unhandled bug loses this attempt
-        # entirely rather than persisting a half-written state.
+        # generation_logs row kept), OR the client disconnected mid-stream
+        # and _run's own `except (GeneratorExit, asyncio.CancelledError)`
+        # caught that too (status set to 'interrupted', whatever was
+        # already produced persisted — see that clause's comment,
+        # 2026-09-04) — every case leaves something worth committing
+        # rather than losing. An uncaught exception instead propagates out
+        # of `async with tenant_session`, which rolls the whole transaction
+        # back — an unhandled bug loses this attempt entirely rather than
+        # persisting a half-written state.
 
 
 async def _run(
@@ -278,233 +285,385 @@ async def _run(
     sermon.status = "generating"
     await db.flush()
 
-    cadence_enabled = await run_in_threadpool(has_cadence_access, tenant_id)
-    try:
-        ctx = await assemble_context(
-            db, sermon, request.passage_reference, request.topic, request.translation,
-            cadence_enabled=cadence_enabled,
-        )
-    except Exception as exc:  # httpx/network errors reaching the Bible API, etc.
-        logger.exception("Context assembly failed for sermon %s", sermon.id)
-        yield _sse("error", {"detail": f"Could not assemble context: {exc}"})
-        return
-
-    yield _sse(
-        "context",
-        {
-            "scripture_resolved": ctx.scripture is not None,
-            "cadence_example_count": len(ctx.cadence_examples),
-            "cadence_available": cadence_enabled,
-            "web_result_count": len(ctx.web_results),
-        },
-    )
-
-    # --- Outline pass: cheap/fast model, not streamed (it's quick, and
-    # the frontend only needs the final outline text, not its tokens).
-    #
-    # Heartbeat-protected (2026-09-03 fix): "quick" assumed no retries —
-    # under real OpenRouter congestion (confirmed live, 2 retries at
-    # 1s/2s backoff observed, sometimes more) a plain `await` here sends
-    # ZERO bytes to the client for that whole window. _run_edit's locate
-    # call already had this exact protection (same shape of call, same
-    # risk) — this brings _run's outline call in line with it, closing
-    # the gap between "fixed there" and "not fixed here" for what is
-    # otherwise the identical failure mode. Same orphaned-task cancel-on-
-    # teardown reasoning as _run_edit's locate call applies here too. ---
-    outline_messages = build_outline_messages(ctx)
-    outline_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
-    outline_task = asyncio.ensure_future(
-        chat_completion(settings.openrouter_outline_model, outline_messages, retry_queue=outline_retry_queue)
-    )
-    try:
-        async for heartbeat in _heartbeat_while_pending(
-            outline_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=outline_retry_queue
-        ):
-            yield heartbeat
-        try:
-            outline_text, outline_raw = await outline_task
-        except OpenRouterError as exc:
-            logger.exception("Outline generation failed for sermon %s", sermon.id)
-            sermon.status = "draft"
-            await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "failed")
-            # logger.exception above has the raw upstream detail; the SSE
-            # event a pastor's browser actually renders gets the sanitized
-            # message instead — see OpenRouterError.user_message's docstring.
-            yield _sse("error", {"detail": exc.user_message})
-            return
-    finally:
-        if not outline_task.done():
-            outline_task.cancel()
-
-    await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "succeeded")
-
-    db.add(
-        GenerationLog(
-            tenant_id=tenant_id,
-            sermon_id=sermon.id,
-            stage=GenerationStage.OUTLINE,
-            model=settings.openrouter_outline_model,
-            prompt={"messages": outline_messages},
-            raw_response=outline_raw,
-        )
-    )
-    await db.flush()
-    yield _sse("outline", {"text": outline_text})
-
-    # --- Draft pass: stronger model, streamed token-by-token so a 30+
-    # second generation isn't silent.
-    #
-    # Heartbeat-protected per-chunk (2026-09-03 fix), mirroring
-    # _run_edit's identical draft-streaming loop exactly: a plain
-    # `async for` over stream_chat_completion sends nothing to the
-    # client during a slow start or a slow gap between tokens (both
-    # observed live under real OpenRouter congestion) — this is very
-    # likely what actually produced a real report's "Error in input
-    # stream" (a chunked response gone silent long enough for the
-    # connection to be treated as dead), on a request whose OUTLINE had
-    # already streamed successfully to the pastor's screen before the
-    # draft call went silent. Also fixes the same orphaned-task-on-
-    # teardown gap _run_edit's version was fixed for. ---
-    draft_messages = build_draft_messages(ctx, outline_text)
+    # 2026-09-04 fix: tracked here (not declared where each is first used
+    # further down) specifically so the `except (GeneratorExit,
+    # CancelledError)` clause at the bottom of this function can see
+    # exactly how far generation got if the client disconnects (tab
+    # closed, network drop, navigation away) mid-stream — see that
+    # clause's own comment for why this exists.
+    outline_messages: list | None = None
+    outline_text: str | None = None
+    outline_raw: str | None = None
+    outline_call_started = False
+    outline_log_written = False
+    draft_messages: list | None = None
     draft_chunks: list[str] = []
     raw_lines: list[str] = []
-    draft_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
-    stream_iter = stream_chat_completion(
-        settings.openrouter_draft_model, draft_messages, raw_sink=raw_lines, retry_queue=draft_retry_queue
-    ).__aiter__()
+    draft_call_started = False
+
     try:
-        while True:
-            next_task = asyncio.ensure_future(stream_iter.__anext__())
+        cadence_enabled = await run_in_threadpool(has_cadence_access, tenant_id)
+        try:
+            ctx = await assemble_context(
+                db, sermon, request.passage_reference, request.topic, request.translation,
+                cadence_enabled=cadence_enabled,
+            )
+        except Exception as exc:  # httpx/network errors reaching the Bible API, etc.
+            logger.exception("Context assembly failed for sermon %s", sermon.id)
+            yield _sse("error", {"detail": f"Could not assemble context: {exc}"})
+            return
+
+        yield _sse(
+            "context",
+            {
+                "scripture_resolved": ctx.scripture is not None,
+                "cadence_example_count": len(ctx.cadence_examples),
+                "cadence_available": cadence_enabled,
+                "web_result_count": len(ctx.web_results),
+            },
+        )
+
+        # --- Outline pass: cheap/fast model, not streamed (it's quick, and
+        # the frontend only needs the final outline text, not its tokens).
+        #
+        # Heartbeat-protected (2026-09-03 fix): "quick" assumed no retries —
+        # under real OpenRouter congestion (confirmed live, 2 retries at
+        # 1s/2s backoff observed, sometimes more) a plain `await` here sends
+        # ZERO bytes to the client for that whole window. _run_edit's locate
+        # call already had this exact protection (same shape of call, same
+        # risk) — this brings _run's outline call in line with it, closing
+        # the gap between "fixed there" and "not fixed here" for what is
+        # otherwise the identical failure mode. Same orphaned-task cancel-on-
+        # teardown reasoning as _run_edit's locate call applies here too. ---
+        outline_messages = build_outline_messages(ctx)
+        outline_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        outline_call_started = True
+        outline_task = asyncio.ensure_future(
+            chat_completion(settings.openrouter_outline_model, outline_messages, retry_queue=outline_retry_queue)
+        )
+        try:
+            async for heartbeat in _heartbeat_while_pending(
+                outline_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=outline_retry_queue
+            ):
+                yield heartbeat
             try:
-                async for heartbeat in _heartbeat_while_pending(
-                    next_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=draft_retry_queue
-                ):
-                    yield heartbeat
-                try:
-                    delta = await next_task
-                except StopAsyncIteration:
-                    break
-            finally:
-                if not next_task.done():
-                    next_task.cancel()
-            draft_chunks.append(delta)
-            yield _sse("delta", {"text": delta})
-    except OpenRouterError as exc:
-        logger.exception("Draft generation failed for sermon %s", sermon.id)
-        sermon.status = "draft"
-        await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "failed")
-        yield _sse("error", {"detail": exc.user_message})
-        return
+                outline_text, outline_raw = await outline_task
+            except OpenRouterError as exc:
+                logger.exception("Outline generation failed for sermon %s", sermon.id)
+                sermon.status = "draft"
+                await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "failed")
+                # logger.exception above has the raw upstream detail; the SSE
+                # event a pastor's browser actually renders gets the sanitized
+                # message instead — see OpenRouterError.user_message's docstring.
+                yield _sse("error", {"detail": exc.user_message})
+                return
+        finally:
+            if not outline_task.done():
+                outline_task.cancel()
 
-    await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "succeeded")
+        await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "succeeded")
 
-    draft_text = "".join(draft_chunks)
-
-    # --- Trust and accuracy: verify every citation before it's shown,
-    # never trust the model's memory of scripture text. ---
-    # Defensive, in addition to (not instead of) fixing the specific gap
-    # this uncovered (bible.py's _fetch_from_bible_api_com used to have
-    # NO exception handling at all — see BibleApiComError). Everything
-    # from here through the final `sermon.content = draft_text` write
-    # MUST still happen even if citation verification breaks in some
-    # way neither of those fixes anticipated: an uncaught exception here
-    # used to roll back the ENTIRE transaction, silently destroying a
-    # draft the pastor had already watched stream to their screen, with
-    # zero trace (confirmed 2026-09-03: a real report reproduced this
-    # exact shape — see the generation_logs table left completely empty
-    # for the affected sermon). The draft is worth more than a citation
-    # check that happened to fail.
-    try:
-        citation_flags = await bible.verify_all_citations(draft_text, request.translation)
-    except Exception:
-        logger.exception(
-            "Citation verification crashed outright for sermon %s — saving the draft anyway, "
-            "with no citation flags this pass (GET /sermons/%s/citations will retry cleanly later).",
-            sermon.id,
-            sermon.id,
-        )
-        citation_flags = []
-
-    flagged = [f for f in citation_flags if f["status"] not in _OK_CITATION_STATUSES]
-    if flagged:
-        logger.warning(
-            "Sermon %s draft has %d unverified/mismatched citation(s): %s",
-            sermon.id,
-            len(flagged),
-            [f["reference"] for f in flagged],
-        )
-
-    db.add(
-        GenerationLog(
-            tenant_id=tenant_id,
-            sermon_id=sermon.id,
-            stage=GenerationStage.DRAFT,
-            model=settings.openrouter_draft_model,
-            prompt={"messages": draft_messages},
-            raw_response="\n".join(raw_lines),
-            citation_flags=citation_flags,
-        )
-    )
-    await db.flush()
-
-    # Phase 8 Task 1 fix: /generate has no guard against being called on
-    # a sermon that already has content (unlike /edit and /outline, which
-    # both check sermon.content is None first) — a regeneration used to
-    # silently overwrite whatever was there, including already-edited/
-    # refined content, with zero recovery trail. Mirrors _run_edit's own
-    # snapshot-before-overwrite pattern exactly, skipped only when there
-    # is genuinely nothing yet to snapshot (the real first-ever
-    # generation for this sermon). REGENERATION_INSTRUCTION_SENTINEL
-    # (not a real edit instruction) lets the version-history UI tell
-    # these rows apart from real edit instructions.
-    if sermon.content is not None:
         db.add(
-            SermonRevision(
+            GenerationLog(
                 tenant_id=tenant_id,
                 sermon_id=sermon.id,
-                content=sermon.content,
-                instruction=REGENERATION_INSTRUCTION_SENTINEL,
+                stage=GenerationStage.OUTLINE,
+                model=settings.openrouter_outline_model,
+                prompt={"messages": outline_messages},
+                raw_response=outline_raw,
             )
         )
+        await db.flush()
+        outline_log_written = True
+        yield _sse("outline", {"text": outline_text})
 
-    sermon.content = draft_text
-    sermon.status = "ready"
-    await db.flush()
+        # --- Draft pass: stronger model, streamed token-by-token so a 30+
+        # second generation isn't silent.
+        #
+        # Heartbeat-protected per-chunk (2026-09-03 fix), mirroring
+        # _run_edit's identical draft-streaming loop exactly: a plain
+        # `async for` over stream_chat_completion sends nothing to the
+        # client during a slow start or a slow gap between tokens (both
+        # observed live under real OpenRouter congestion) — this is very
+        # likely what actually produced a real report's "Error in input
+        # stream" (a chunked response gone silent long enough for the
+        # connection to be treated as dead), on a request whose OUTLINE had
+        # already streamed successfully to the pastor's screen before the
+        # draft call went silent. Also fixes the same orphaned-task-on-
+        # teardown gap _run_edit's version was fixed for. ---
+        draft_messages = build_draft_messages(ctx, outline_text)
+        draft_retry_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        draft_call_started = True
+        stream_iter = stream_chat_completion(
+            settings.openrouter_draft_model, draft_messages, raw_sink=raw_lines, retry_queue=draft_retry_queue
+        ).__aiter__()
+        try:
+            while True:
+                next_task = asyncio.ensure_future(stream_iter.__anext__())
+                try:
+                    async for heartbeat in _heartbeat_while_pending(
+                        next_task, _HEARTBEAT_INTERVAL_SECONDS, retry_queue=draft_retry_queue
+                    ):
+                        yield heartbeat
+                    try:
+                        delta = await next_task
+                    except StopAsyncIteration:
+                        break
+                finally:
+                    if not next_task.done():
+                        next_task.cancel()
+                draft_chunks.append(delta)
+                yield _sse("delta", {"text": delta})
+        except OpenRouterError as exc:
+            logger.exception("Draft generation failed for sermon %s", sermon.id)
+            sermon.status = "draft"
+            await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "failed")
+            yield _sse("error", {"detail": exc.user_message})
+            return
 
-    # Finalization is exactly the trigger point Phase 4 specifies for
-    # cadence-corpus ingestion. chunk_text is cheap/synchronous; the
-    # actual embedding call is queued inside ingest_text (via
-    # app/tasks/embeddings.py) — this response is already streaming back
-    # to the pastor, and an extra OpenRouter round trip to embed the
-    # sermon for FUTURE cadence-matching searches has no reason to hold
-    # it up.
-    #
-    # Same "the draft is already saved, don't lose it over a downstream
-    # failure" guard as citation verification above — this is a nice-to-
-    # have for FUTURE cadence matching, not something worth risking an
-    # already-successful, already-saved generation over.
-    try:
-        await ingest_text(
-            db,
-            tenant_id,
-            corpus_type=CorpusType.CADENCE.value,
-            source=DocumentSource.GENERATED.value,
-            title=sermon.title,
-            text=draft_text,
-            sermon_id=sermon.id,
+        await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "succeeded")
+
+        draft_text = "".join(draft_chunks)
+
+        # --- Trust and accuracy: verify every citation before it's shown,
+        # never trust the model's memory of scripture text. ---
+        # Defensive, in addition to (not instead of) fixing the specific gap
+        # this uncovered (bible.py's _fetch_from_bible_api_com used to have
+        # NO exception handling at all — see BibleApiComError). Everything
+        # from here through the final `sermon.content = draft_text` write
+        # MUST still happen even if citation verification breaks in some
+        # way neither of those fixes anticipated: an uncaught exception here
+        # used to roll back the ENTIRE transaction, silently destroying a
+        # draft the pastor had already watched stream to their screen, with
+        # zero trace (confirmed 2026-09-03: a real report reproduced this
+        # exact shape — see the generation_logs table left completely empty
+        # for the affected sermon). The draft is worth more than a citation
+        # check that happened to fail.
+        try:
+            citation_flags = await bible.verify_all_citations(draft_text, request.translation)
+        except Exception:
+            logger.exception(
+                "Citation verification crashed outright for sermon %s — saving the draft anyway, "
+                "with no citation flags this pass (GET /sermons/%s/citations will retry cleanly later).",
+                sermon.id,
+                sermon.id,
+            )
+            citation_flags = []
+
+        flagged = [f for f in citation_flags if f["status"] not in _OK_CITATION_STATUSES]
+        if flagged:
+            logger.warning(
+                "Sermon %s draft has %d unverified/mismatched citation(s): %s",
+                sermon.id,
+                len(flagged),
+                [f["reference"] for f in flagged],
+            )
+
+        db.add(
+            GenerationLog(
+                tenant_id=tenant_id,
+                sermon_id=sermon.id,
+                stage=GenerationStage.DRAFT,
+                model=settings.openrouter_draft_model,
+                prompt={"messages": draft_messages},
+                raw_response="\n".join(raw_lines),
+                citation_flags=citation_flags,
+            )
         )
-    except Exception:
-        logger.exception(
-            "Cadence-corpus ingestion failed for sermon %s — draft is already saved; this only "
-            "affects future cadence-matching for this one sermon.",
-            sermon.id,
+        await db.flush()
+
+        # Phase 8 Task 1 fix: /generate has no guard against being called on
+        # a sermon that already has content (unlike /edit and /outline, which
+        # both check sermon.content is None first) — a regeneration used to
+        # silently overwrite whatever was there, including already-edited/
+        # refined content, with zero recovery trail. Mirrors _run_edit's own
+        # snapshot-before-overwrite pattern exactly, skipped only when there
+        # is genuinely nothing yet to snapshot (the real first-ever
+        # generation for this sermon). REGENERATION_INSTRUCTION_SENTINEL
+        # (not a real edit instruction) lets the version-history UI tell
+        # these rows apart from real edit instructions.
+        if sermon.content is not None:
+            db.add(
+                SermonRevision(
+                    tenant_id=tenant_id,
+                    sermon_id=sermon.id,
+                    content=sermon.content,
+                    instruction=REGENERATION_INSTRUCTION_SENTINEL,
+                )
+            )
+
+        sermon.content = draft_text
+        sermon.status = "ready"
+        await db.flush()
+
+        # Finalization is exactly the trigger point Phase 4 specifies for
+        # cadence-corpus ingestion. chunk_text is cheap/synchronous; the
+        # actual embedding call is queued inside ingest_text (via
+        # app/tasks/embeddings.py) — this response is already streaming back
+        # to the pastor, and an extra OpenRouter round trip to embed the
+        # sermon for FUTURE cadence-matching searches has no reason to hold
+        # it up.
+        #
+        # Same "the draft is already saved, don't lose it over a downstream
+        # failure" guard as citation verification above — this is a nice-to-
+        # have for FUTURE cadence matching, not something worth risking an
+        # already-successful, already-saved generation over.
+        try:
+            await ingest_text(
+                db,
+                tenant_id,
+                corpus_type=CorpusType.CADENCE.value,
+                source=DocumentSource.GENERATED.value,
+                title=sermon.title,
+                text=draft_text,
+                sermon_id=sermon.id,
+            )
+        except Exception:
+            logger.exception(
+                "Cadence-corpus ingestion failed for sermon %s — draft is already saved; this only "
+                "affects future cadence-matching for this one sermon.",
+                sermon.id,
+            )
+
+        yield _sse("citations", {"flags": citation_flags})
+
+        # Usage metering already happened per-LLM-call above (_record_llm_call
+        # at the outline and draft steps) — nothing left to record here.
+        yield _sse(
+            "done", {"sermon_id": str(sermon.id), "status": sermon.status, "flagged_citation_count": len(flagged)}
         )
 
-    yield _sse("citations", {"flags": citation_flags})
+    except (GeneratorExit, asyncio.CancelledError):
+        # 2026-09-04 fix: the client disconnecting mid-generation (tab
+        # closed, network drop, navigated away) used to be silent AND
+        # destructive. GeneratorExit/CancelledError thrown into this
+        # generator at whatever await/yield point it was suspended
+        # propagated straight out through generate_sermon_stream's `async
+        # with tenant_session(...)` — session.begin() rolls back on ANY
+        # exception, and both of these are BaseException subclasses that
+        # `except Exception`/`except OpenRouterError` above never intercept
+        # — silently destroying even an outline that had already streamed
+        # to the pastor's screen, with nothing logged anywhere.
+        #
+        # Confirmed as the real mechanism behind a real report: sermon
+        # 8d0dc646-684a-40d1-a5ab-fe4709c4713e ("Coal to the Lips, Fire in
+        # the Feet", 2026-09-03) showed exactly this signature — a
+        # usage_events row for a SUCCEEDED outline, zero generation_logs
+        # rows, content NULL, status left at 'draft' — with a ~4-minute gap
+        # in the backend's own access log between the /generate request and
+        # the client's next request, and zero retry/error log lines in
+        # between (ruling out an OpenRouter-side failure). This is a
+        # DIFFERENT gap than this morning's citation-verification/cadence-
+        # ingestion guard above: that one guards failures AFTER a full
+        # draft is assembled; this is the client going away before the
+        # draft ever finished.
+        #
+        # Deliberately NOT re-raised: catching it here and returning
+        # normally (instead of propagating) is what lets
+        # generate_sermon_stream's `async with tenant_session` COMMIT what's
+        # persisted below, rather than roll it back.
+        #
+        # `with anyio.CancelScope(shield=True)` below is NOT optional
+        # decoration — confirmed live (2026-09-04) that without it, this
+        # whole handler still loses everything. Starlette's disconnect
+        # cancellation is an anyio cancel SCOPE, not a one-shot
+        # asyncio.Task.cancel(): anyio's asyncio backend
+        # (CancelScope._deliver_cancellation) keeps re-delivering
+        # CancelledError to this task on every loop iteration via
+        # call_soon, for as long as the task is still registered in that
+        # (already-cancelled) scope — which is true for every await in
+        # this except block too, since we're still inside the same task
+        # Starlette cancelled. The very first recovery `await` below (with
+        # no shield) was reproduced getting re-cancelled before it could
+        # finish, propagating a SECOND CancelledError out of this except
+        # block uncaught — rolling back the whole transaction exactly like
+        # the original bug, only silently (never even reaching the
+        # logger.warning at the end). A plain `except
+        # asyncio.CancelledError: <do async cleanup>` is a well-known
+        # anyio trap for exactly this reason — shielding is the documented
+        # fix. Everything from here through the explicit `db.commit()` at
+        # the end must stay inside the shield.
+        #
+        # What gets persisted, and why:
+        # - A completed outline (the LLM call itself already succeeded) is
+        #   real, working output — its GenerationLog row is written now if
+        #   the normal path above hadn't already gotten to it.
+        # - A PARTIAL draft is NEVER written to sermon.content. Text that
+        #   *looks* like a finished, ready-to-preach manuscript but is
+        #   actually cut off mid-sentence, with zero citation verification
+        #   ever run on it, is worse than nothing — a pastor has no way to
+        #   tell it's incomplete just by reading it. It's kept instead as a
+        #   GenerationLog row explicitly marked `"interrupted": True` in its
+        #   prompt field — real material for support or a future "resume"
+        #   feature, but never mistaken for a usable sermon.
+        # - sermon.status becomes "interrupted" unconditionally: a state
+        #   distinct from both "draft" (never attempted) and "generating"
+        #   (still genuinely in flight), so the pastor sees an attempt was
+        #   made and cut short rather than silence indistinguishable from
+        #   "I never clicked generate" — and knows to just retry rather than
+        #   wonder whether something's recoverable (nothing user-facing is;
+        #   see above).
+        with anyio.CancelScope(shield=True):
+            if outline_text is not None and not outline_log_written:
+                db.add(
+                    GenerationLog(
+                        tenant_id=tenant_id,
+                        sermon_id=sermon.id,
+                        stage=GenerationStage.OUTLINE,
+                        model=settings.openrouter_outline_model,
+                        prompt={"messages": outline_messages},
+                        raw_response=outline_raw,
+                    )
+                )
+            elif outline_call_started and outline_text is None:
+                await _record_llm_call(tenant_id, sermon.id, GenerationStage.OUTLINE, "interrupted")
 
-    # Usage metering already happened per-LLM-call above (_record_llm_call
-    # at the outline and draft steps) — nothing left to record here.
-    yield _sse("done", {"sermon_id": str(sermon.id), "status": sermon.status, "flagged_citation_count": len(flagged)})
+            if draft_call_started:
+                partial_draft = "".join(draft_chunks)
+                await _record_llm_call(tenant_id, sermon.id, GenerationStage.DRAFT, "interrupted")
+                db.add(
+                    GenerationLog(
+                        tenant_id=tenant_id,
+                        sermon_id=sermon.id,
+                        stage=GenerationStage.DRAFT,
+                        model=settings.openrouter_draft_model,
+                        prompt={"messages": draft_messages, "interrupted": True},
+                        raw_response="\n".join(raw_lines),
+                    )
+                )
+                progress = (
+                    f"outline completed, draft interrupted {len(partial_draft)} character(s) in "
+                    "(kept in generation_logs, NOT saved as content)"
+                    if outline_text is not None
+                    else f"draft interrupted {len(partial_draft)} character(s) in (kept in generation_logs, "
+                    "NOT saved as content)"
+                )
+            elif outline_text is not None:
+                progress = f"outline completed ({len(outline_text)} chars, preserved), draft never started"
+            elif outline_call_started:
+                progress = "interrupted during the outline pass — no usable output produced"
+            else:
+                progress = "interrupted before the outline pass started (context assembly or startup)"
+
+            sermon.status = "interrupted"
+            # An explicit commit — not a flush — and still deliberately
+            # inside the shield. generate_sermon_stream's `async with
+            # tenant_session(...)` (session.begin()) would normally do this
+            # commit itself on a clean exit, but that happens AFTER this
+            # function returns, i.e. AFTER the shield above has already
+            # closed — leaving it exposed to exactly the same repeated-
+            # cancellation problem this shield exists to solve. Committing
+            # here, still shielded, is what actually survives. (Confirmed
+            # safe: session.begin() no-ops cleanly on its own exit when the
+            # transaction it opened has already been committed manually
+            # inside the block.)
+            await db.commit()
+            logger.warning(
+                "Generation for sermon %s was interrupted mid-stream (client disconnected) — %s.",
+                sermon.id,
+                progress,
+            )
+        return
 
 
 async def generate_outline_from_manuscript(

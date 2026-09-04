@@ -361,7 +361,20 @@ export default function SermonDetailPage({ params }: { params: Promise<{ id: str
         </p>
       </div>
 
-      {(sermon.status === "draft" || generating) && !draftText && (
+      {sermon.status === "interrupted" && !generating && !draftText && (
+        // 2026-09-04: a previous attempt was cut short by a disconnect
+        // mid-stream (see backend app/services/generation.py's `_run`,
+        // `except (GeneratorExit, asyncio.CancelledError)`) — content is
+        // deliberately never partially saved, so there is nothing to
+        // recover here; retrying from scratch is the honest, correct
+        // next step, not a guess.
+        <div className="bg-secondary/50 rounded-lg p-3 text-sm">
+          Your last generation attempt was interrupted before it finished (e.g. a dropped connection) —
+          nothing usable was produced, so it&apos;s safe to just generate again.
+        </div>
+      )}
+
+      {(sermon.status === "draft" || sermon.status === "interrupted" || generating) && !draftText && (
         <form onSubmit={handleGenerate} className="border-border flex flex-col gap-3 rounded-lg border p-4">
           <h2 className="text-sm font-semibold">Generate</h2>
           <label className="flex flex-col gap-1.5 text-sm">

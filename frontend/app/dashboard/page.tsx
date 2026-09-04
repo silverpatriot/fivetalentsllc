@@ -17,6 +17,10 @@ type StudyDocument = { id: string };
 const STATUS_LABEL: Record<string, string> = {
   draft: "Draft",
   generating: "Generating…",
+  // 2026-09-04: an attempt was cut short by a disconnect mid-stream, not
+  // a failure and not "never attempted" — see app/services/generation.py
+  // (backend)'s `_run`, `except (GeneratorExit, asyncio.CancelledError)`.
+  interrupted: "Interrupted — retry",
   ready: "Ready for review",
   published: "Published",
 };
@@ -40,7 +44,9 @@ async function getStudyDocumentCount(): Promise<number> {
 
 export default async function DashboardHome() {
   const [sermons, studyDocumentCount] = await Promise.all([getRecentSermons(), getStudyDocumentCount()]);
-  const inProgressCount = sermons.filter((s) => s.status === "draft" || s.status === "generating").length;
+  const inProgressCount = sermons.filter(
+    (s) => s.status === "draft" || s.status === "generating" || s.status === "interrupted",
+  ).length;
   const recent = sermons.slice(0, 3);
 
   return (
